@@ -1,0 +1,15 @@
+[package]
+name = "masquerade"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = { version = "0.4", features = ["std"] }
+env_logger = "0.10"
+url = "1"
+
+quiche = "0.16.0"
+mio = { version = "0.8", features = ["net", "os-poll"] }
+ring = "0.16"
