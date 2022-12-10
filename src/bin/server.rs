@@ -32,9 +32,15 @@
 extern crate log;
 
 use std::net;
-
+use std::net::ToSocketAddrs;
 use std::collections::HashMap;
+use std::io::{self, Read, Write};
+use std::str::from_utf8;
+use std::collections::VecDeque;
 
+use bimap::BiMap;
+use mio::{Token, Poll};
+use mio::net::TcpStream;
 use ring::rand::*;
 
 use quiche::h3::NameValue;
@@ -44,13 +50,26 @@ const MAX_DATAGRAM_SIZE: usize = 1350;
 const HOST: &str = "127.0.0.1";
 const PORT: usize = 4433;
 
+const SERVER: Token = Token(0);
+
+#[derive(PartialEq)]
+enum ConnectStreamState {
+    RequestReceived,
+    ConnectionEstablished,
+}
+
+struct ConnectStream {
+    state: ConnectStreamState,
+    socket: TcpStream,
+    write_queue: VecDeque<Vec<u8>> 
+}
+
 struct PartialResponse {
     headers: Option<Vec<quiche::h3::Header>>,
-
     body: Vec<u8>,
-
     written: usize,
 }
+
 
 struct Client {
     conn: quiche::Connection,
@@ -58,9 +77,12 @@ struct Client {
     http3_conn: Option<quiche::h3::Connection>,
 
     partial_responses: HashMap<u64, PartialResponse>,
+
+    connect_streams: HashMap<u64, ConnectStream>, // Stream ID to ConnectStream
 }
 
 type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
+type TokenMap = BiMap<Token, (quiche::ConnectionId<'static>, u64)>;
 
 fn main() {
     env_logger::init();
@@ -78,7 +100,7 @@ fn main() {
     let mut socket =
         mio::net::UdpSocket::bind(format!("{}:{}", HOST, PORT).parse().unwrap()).unwrap();
     poll.registry()
-        .register(&mut socket, mio::Token(0), mio::Interest::READABLE)
+        .register(&mut socket, SERVER, mio::Interest::READABLE)
         .unwrap();
 
     debug!("listening on {}:{}", HOST, PORT);
@@ -97,7 +119,7 @@ fn main() {
         .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
         .unwrap();
 
-    config.set_max_idle_timeout(5000);
+    config.set_max_idle_timeout(10000);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_initial_max_data(10_000_000);
@@ -116,8 +138,11 @@ fn main() {
         ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
 
     let mut clients = ClientMap::new();
+    let mut tcp_connections = TokenMap::new();
 
     let local_addr = socket.local_addr().unwrap();
+    
+    let mut unique_token = Token(SERVER.0 + 1);
 
     loop {
         // Find the shorter timeout from all the active connections.
@@ -127,6 +152,183 @@ fn main() {
 
         poll.poll(&mut events, timeout).unwrap();
 
+        for event in events.iter() {
+            trace!("Poll event on token {}", event.token().0);
+            match event.token() {
+                SERVER => {} // ignore it for now, handles all read and write to QUIC later
+                token => {
+                    trace!("Poll event on token {} for TCP", event.token().0);
+                    let remove_token = if let Some((connection_id, stream_id)) = tcp_connections.get_by_left(&token) {
+                        trace!("Poll event on token {} for TCP connection {:?} stream {}", event.token().0, connection_id, stream_id);
+                        let client = clients.get_mut(connection_id).unwrap();
+                        let connect_session = client.connect_streams.get_mut(stream_id).unwrap();
+                        let connection = &mut connect_session.socket;
+                        let mut connection_closed = false;
+                        let mut http_conn_closed = false;
+
+                        if connect_session.state == ConnectStreamState::RequestReceived {
+                            if let Ok(addr) = connection.peer_addr() {
+                                debug!("TCP connection established to {} for connection {:?} stream {}", addr, connection_id, stream_id);
+                                connect_session.state = ConnectStreamState::ConnectionEstablished;
+
+                                // Send 2xx HEADERS to inform client connection established
+                                let headers = vec![
+                                    quiche::h3::Header::new(b":status", b"200"),
+                                    quiche::h3::Header::new(b"content-length", b"0"), // NOTE: is this needed?
+                                ];
+                                match client.http3_conn.as_mut().unwrap().send_response(&mut client.conn, *stream_id, &headers, false) {
+                                    Ok(v) => v,
+                            
+                                    Err(quiche::h3::Error::StreamBlocked) => {
+                                        // TODO: handle partial response using queue
+                                        let response = PartialResponse {
+                                            headers: Some(headers),
+                                            body: b"".to_vec(),
+                                            written: 0,
+                                        };
+                            
+                                        client.partial_responses.insert(*stream_id, response);
+                                    },
+                            
+                                    Err(e) => {
+                                        error!("{} stream send failed {:?}", client.conn.trace_id(), e);
+                                    },
+                                }
+                            }
+                        } 
+
+                        if event.is_readable() {
+                            let mut received_data = vec![0; 4096];
+                            let mut bytes_read = 0;
+                            // We can (maybe) read from the connection.
+                            loop {
+                                match connection.read(&mut received_data[bytes_read..]) {
+                                    Ok(0) => {
+                                        // Reading 0 bytes means the other side has closed the
+                                        // connection or is done writing, then so are we.
+                                        debug!("Received 0 bytes from TCP, connection {:?} session {}", connection_id, stream_id);
+                                        connection_closed = true;
+                                        break;
+                                    }
+                                    Ok(n) => {
+                                        bytes_read += n;
+                                        if bytes_read == received_data.len() {
+                                            received_data.resize(received_data.len() + 1024, 0);
+                                        }
+                                        debug!("Received {} bytes from TCP, connection {:?} session {}", n, connection_id, stream_id);
+                                    }
+                                    // Would block "errors" are the OS's way of saying that the
+                                    // connection is not actually ready to perform this I/O operation.
+                                    Err(ref err) if would_block(err) => break,
+                                    Err(ref err) if interrupted(err) => continue,
+                                    Err(err) => {
+                                        // Other errors we'll consider fatal.
+                                        error!("Error in reading TCP connection {}", err);
+                                        connection_closed = true;
+                                        break;
+                                    },
+                                }
+                            }
+                    
+                            if bytes_read != 0 {
+                                let received_data = &received_data[..bytes_read];
+                                // Relay data to client
+                                debug!("Received {} bytes, connection {:?} session {}", bytes_read, connection_id, stream_id);
+                                trace!("{}", unsafe {
+                                    std::str::from_utf8_unchecked(received_data)
+                                });
+                                
+                                let written = match client.http3_conn.as_mut().unwrap().send_body(&mut client.conn, *stream_id, received_data, connection_closed) {
+                                    Ok(v) => { http_conn_closed = connection_closed; v},
+                            
+                                    Err(quiche::h3::Error::Done) => 0, // TODO: handle this
+                            
+                                    Err(e) => {
+                                        error!("connection {:?} stream {} send failed {:?}", connection_id, stream_id, e);
+                                        connection_closed = true;
+                                        0
+                                        // TODO: handle error
+                                        // return;
+                                    },
+                                };
+                            
+                                if written < received_data.len() {
+                                    // TODO: handle partial write correctly: retry next time, add a queue
+                                    error!("connection {:?} stream {} partially written {} bytes of {} bytes", connection_id, stream_id, written, received_data.len());
+                                }
+
+                                if let Ok(str_buf) = from_utf8(received_data) {
+                                    debug!("Received data: {}", str_buf.trim_end());
+                                } else {
+                                    debug!("Received (none UTF-8) data: {:?}", received_data);
+                                }
+                            }
+                        } 
+                        
+                        if !connection_closed && event.is_writable() {
+                            // TODO: if event is writable
+                            trace!("event for token {} is writable", token.0);
+                            if connect_session.state == ConnectStreamState::ConnectionEstablished {
+                                debug!("TCP connection is checked established");
+
+                                while let Some(data) = connect_session.write_queue.front() {
+                                    trace!("writing to TCP connection");
+                                    trace!("{}", unsafe {
+                                        std::str::from_utf8_unchecked(data)
+                                    });
+                                    match connection.write(data) {
+                                        // We want to write the entire `DATA` buffer in a single go. If we
+                                        // write less we'll return a short write error (same as
+                                        // `io::Write::write_all` does).
+                                        Ok(n) => {
+                                            // TODO: handle short write
+                                            debug!("Sent {} bytes to {}", n, connection.peer_addr().unwrap());
+                                            connect_session.write_queue.pop_front();
+                                        },
+                                        // Would block "errors" are the OS's way of saying that the
+                                        // connection is not actually ready to perform this I/O operation.
+                                        Err(ref err) if would_block(err) => {
+                                            debug!("write() would block");
+                                            break;
+                                        }
+                                        // Got interrupted (how rude!), we'll try again.
+                                        Err(ref err) if interrupted(err) => { 
+                                            debug!("write() interupted");
+                                            continue;
+                                        }
+                                        // Other errors we'll consider fatal.
+                                        Err(err) => {
+                                            error!("Error in writing TCP connection {}", err);
+                                            connection_closed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                    
+                        if connection_closed {
+                            debug!("Connection closed on connection {:?} stream {}", connection_id, stream_id);
+                            poll.registry().deregister(connection).expect("poll registry deregister failed");
+                            if !http_conn_closed {
+                                client.http3_conn.as_mut().unwrap().send_body(&mut client.conn, *stream_id, b"", true); // TODO: is this correct for server to close the stream? Also, error check missing
+                                client.conn.stream_shutdown(*stream_id, quiche::Shutdown::Read, 0);
+                            }
+                            connection.shutdown(std::net::Shutdown::Both);
+                            client.connect_streams.remove(stream_id);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {false};
+                    if remove_token {
+                        tcp_connections.remove_by_left(&token);
+                    }
+                }
+            }
+        }
+
         // Read incoming UDP packets from the socket and feed them to quiche,
         // until there are no more packets to read.
         'read: loop {
@@ -134,7 +336,7 @@ fn main() {
             // has expired, so handle it without attempting to read packets. We
             // will then proceed with the send loop.
             if events.is_empty() {
-                debug!("timed out");
+                debug!("timed out"); // TODO: really?
 
                 clients.values_mut().for_each(|c| c.conn.on_timeout());
 
@@ -279,6 +481,7 @@ fn main() {
                     conn,
                     http3_conn: None,
                     partial_responses: HashMap::new(),
+                    connect_streams: HashMap::new(),
                 };
 
                 clients.insert(scid.clone(), client);
@@ -355,6 +558,9 @@ fn main() {
                                 stream_id,
                                 &list,
                                 "examples/root",
+                                &mut poll,
+                                &mut unique_token,
+                                &mut tcp_connections,
                             );
                         },
 
@@ -364,6 +570,26 @@ fn main() {
                                 client.conn.trace_id(),
                                 stream_id
                             );
+                            
+                            if client.connect_streams.contains_key(&stream_id) {
+                                while let Ok(read) = http3_conn.recv_body(&mut client.conn, stream_id, &mut buf) {
+                                    debug!(
+                                        "got {} bytes of data on stream {}",
+                                        read, stream_id
+                                    );
+                                    trace!("{}", unsafe {
+                                        std::str::from_utf8_unchecked(&buf[..read])
+                                    });
+            
+                                    client.connect_streams.get_mut(&stream_id).unwrap().write_queue.push_back(buf[..read].to_vec());
+                                }
+                                poll.registry()
+                                    .reregister(
+                                        &mut client.connect_streams.get_mut(&stream_id).unwrap().socket, 
+                                        tcp_connections.get_by_right(&(client.conn.source_id(), stream_id)).unwrap().to_owned(), 
+                                        mio::Interest::READABLE | mio::Interest::WRITABLE
+                                    ).expect("poll registry reregister failed");  // re-register to receive a new writable event when socket is writable
+                            }
                         },
 
                         Ok((_stream_id, quiche::h3::Event::Finished)) => (),
@@ -508,7 +734,7 @@ fn validate_token<'a>(
 /// Handles incoming HTTP/3 requests.
 fn handle_request(
     client: &mut Client, stream_id: u64, headers: &[quiche::h3::Header],
-    root: &str,
+    root: &str, poll: &mut Poll, current_token: &mut Token, tcp_connections: &mut TokenMap
 ) {
     let conn = &mut client.conn;
     let http3_conn = &mut client.http3_conn.as_mut().unwrap();
@@ -523,51 +749,106 @@ fn handle_request(
     // We decide the response based on headers alone, so stop reading the
     // request stream so that any body is ignored and pointless Data events
     // are not generated.
-    conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
-        .unwrap();
+    // conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
+    //     .unwrap();
 
-    let (headers, body) = build_response(root, headers);
+    // TODO: Handle CONNECT: 
+    /*
+     * 0. Connect TcpStream
+     * 1. Add to connect_streams
+     * 2. Register to poll
+     */
 
-    match http3_conn.send_response(conn, stream_id, &headers, false) {
-        Ok(v) => v,
+    let mut method = None;
+    let mut authority = None;
 
-        Err(quiche::h3::Error::StreamBlocked) => {
-            let response = PartialResponse {
-                headers: Some(headers),
-                body,
-                written: 0,
+    // Look for the request's path and method.
+    for hdr in headers {
+        match hdr.name() {
+            b":method" => method = Some(hdr.value()),
+            b":authority" => authority = Some(std::str::from_utf8(hdr.value()).unwrap()),
+            _ => (),
+        }
+    }
+
+    match method {
+        Some(b"CONNECT") => {
+            if let Some(authority) = authority {
+                if let Ok(target_url) = url::Url::parse(authority) {
+                    let peer_addr = target_url.to_socket_addrs().unwrap().next().unwrap();
+                    match TcpStream::connect(peer_addr) {
+                        Ok(stream) => {
+                            debug!("connecting to url {} {}", target_url, target_url.to_socket_addrs().unwrap().next().unwrap());
+                            // TODO: check authorization
+                            client.connect_streams.insert(stream_id, ConnectStream { 
+                                state: ConnectStreamState::RequestReceived, 
+                                socket: stream, 
+                                write_queue: VecDeque::new() 
+                            });
+                            let token = next(current_token);
+                            poll.registry()
+                                .register(
+                                    &mut client.connect_streams.get_mut(&stream_id).unwrap().socket, 
+                                    token, 
+                                    mio::Interest::READABLE | mio::Interest::WRITABLE
+                                ).expect("poll registry register failed");
+                            tcp_connections.insert(token, (conn.source_id().into_owned(), stream_id));
+                        },
+                        Err(_) => {}, // TODO: send error
+                    }
+                } else {
+                    // TODO: send error
+                }
+            } else {
+                // TODO: send error
+            }
+        },
+
+        _ => {
+            let (headers, body) = build_response(root, headers);
+
+            match http3_conn.send_response(conn, stream_id, &headers, false) {
+                Ok(v) => v,
+
+                Err(quiche::h3::Error::StreamBlocked) => {
+                    let response = PartialResponse {
+                        headers: Some(headers),
+                        body,
+                        written: 0,
+                    };
+
+                    client.partial_responses.insert(stream_id, response);
+                    return;
+                },
+
+                Err(e) => {
+                    error!("{} stream send failed {:?}", conn.trace_id(), e);
+                    return;
+                },
+            }
+
+            let written = match http3_conn.send_body(conn, stream_id, &body, true) {
+                Ok(v) => v,
+
+                Err(quiche::h3::Error::Done) => 0,
+
+                Err(e) => {
+                    error!("{} stream send failed {:?}", conn.trace_id(), e);
+                    return;
+                },
             };
 
-            client.partial_responses.insert(stream_id, response);
-            return;
-        },
+            if written < body.len() {
+                let response = PartialResponse {
+                    headers: None,
+                    body,
+                    written,
+                };
 
-        Err(e) => {
-            error!("{} stream send failed {:?}", conn.trace_id(), e);
-            return;
-        },
-    }
-
-    let written = match http3_conn.send_body(conn, stream_id, &body, true) {
-        Ok(v) => v,
-
-        Err(quiche::h3::Error::Done) => 0,
-
-        Err(e) => {
-            error!("{} stream send failed {:?}", conn.trace_id(), e);
-            return;
+                client.partial_responses.insert(stream_id, response);
+            }
         },
     };
-
-    if written < body.len() {
-        let response = PartialResponse {
-            headers: None,
-            body,
-            written,
-        };
-
-        client.partial_responses.insert(stream_id, response);
-    }
 }
 
 /// Builds an HTTP/3 response given a request.
@@ -673,4 +954,18 @@ pub fn hdrs_to_strings(hdrs: &[quiche::h3::Header]) -> Vec<(String, String)> {
             (name, value)
         })
         .collect()
+}
+
+fn next(current: &mut Token) -> Token {
+    let next = current.0;
+    current.0 += 1;
+    Token(next)
+}
+
+fn would_block(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::WouldBlock
+}
+
+fn interrupted(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::Interrupted
 }

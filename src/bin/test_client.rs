@@ -144,8 +144,9 @@ fn main() {
     
     let mut http3_conn = None;
     
-    let mut stream_states = HashMap::new();
-    // let mut socket_streams = BiMap::new();
+    let mut state = ConnectStreamState::RequestNotSent;
+    let mut get_sent = false;
+    let mut stream_id = 0;
 
     let timeout = conn.timeout();
 
@@ -159,7 +160,7 @@ fn main() {
             // has expired, so handle it without attempting to read packets. We
             // will then proceed with the send loop.
             if events.is_empty() {
-                debug!("socket timed out");
+                debug!("socket timed out"); //TODO: really?
 
                 conn.on_timeout();
 
@@ -219,31 +220,35 @@ fn main() {
 
         if let Some(h3_conn) = &mut http3_conn {
             // Send HTTP requests once the QUIC connection is established
-            stream_states = stream_states.into_iter().map(|(stream, state)| {
-                match state {
-                    ConnectStreamState::RequestNotSent => {
-                        let headers = vec![
-                            quiche::h3::Header::new(b":method", b"CONNECT"),
-                            quiche::h3::Header::new(b":authority", b"example.com:443"),
-                            quiche::h3::Header::new(b":authorization", b"something"),                    
-                            // quiche::h3::Header::new(b":method", b"GET"),
-                            // quiche::h3::Header::new(b":scheme", b"https"),
-                            // quiche::h3::Header::new(b":authority", b"cloudflare-quic.com"),
-                            // quiche::h3::Header::new(b":path", b"/"),
-                            // quiche::h3::Header::new(b"user-agent", b"quiche"),
-                        ];
-                            
-                        info!("sending HTTP request {:?}", headers);
-            
-                        let stream_id = h3_conn.send_request(&mut conn, &headers, true).unwrap();
-            
-                        info!("sent HTTP request on stream id: {}", stream_id);
-            
-                        (stream_id, ConnectStreamState::RequestSent)
+            state = match state {
+                ConnectStreamState::RequestNotSent => {
+                    let headers = vec![
+                        quiche::h3::Header::new(b":method", b"CONNECT"),
+                        quiche::h3::Header::new(b":authority", b"http://example.com"),
+                        // quiche::h3::Header::new(b":authority", b"http://127.0.0.1:8888"),
+                        quiche::h3::Header::new(b":authorization", b"something"),
+                    ];
+                        
+                    info!("sending HTTP request {:?}", headers);
+        
+                    stream_id = h3_conn.send_request(&mut conn, &headers, false).unwrap();
+        
+                    info!("sent HTTP request on stream id: {}", stream_id);
+        
+                    ConnectStreamState::RequestSent
+                }
+                ConnectStreamState::ConnectionEstablished => {
+                    if !get_sent {
+                        let body = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+                        info!("sending HTTP body {:?}", body);
+                        h3_conn.send_body(&mut conn, stream_id, body, false).expect("HTTP body send failed");
+                        info!("sent HTTP body on stream id: {}", stream_id);
+                        get_sent = true;
                     }
-                    _ => (stream, state)
-                } 
-            }).collect();
+                    ConnectStreamState::ConnectionEstablished
+                }
+                other => other
+            };
         
         
             // Process HTTP/3 events.
@@ -255,6 +260,7 @@ fn main() {
                             hdrs_to_strings(&list),
                             stream_id
                         );
+                        state = ConnectStreamState::ConnectionEstablished;
                     },
     
                     Ok((stream_id, quiche::h3::Event::Data)) => {
