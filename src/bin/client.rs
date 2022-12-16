@@ -114,8 +114,7 @@ impl<F, S> Client<F, S> where F: FnMut(&mut ConnectStream<S>, &mut VecDeque<ToSe
 
     pub fn add_socket(&mut self, token: Token, mut socket: TcpStream, state: S, handler: F) {
         self.handlers.insert(token, handler);
-        let token = self.next_token();
-        self.poll.registry().register(&mut socket, token, mio::Interest::READABLE | mio::Interest::WRITABLE);
+        self.poll.registry().register(&mut socket, token, mio::Interest::READABLE).expect("poll register failed");
         self.streams.insert(token, ConnectStream {
             stream_id: None,
             state,
@@ -229,11 +228,11 @@ impl<F, S> Client<F, S> where F: FnMut(&mut ConnectStream<S>, &mut VecDeque<ToSe
                 );
             }
 
-            self.process_socket_read(&events, &mut buf, &mut out);
+            self.process_socket_read(&events);
             self.handle_sockets();
             self.process_h3_read(&mut buf);
             self.process_h3_write();
-            self.process_socket_write(&events, &mut buf, &mut out);
+            self.process_socket_write();
             self.process_quic_write(&mut buf, &mut out);
 
             final_events_handler(self, &events);
@@ -266,7 +265,7 @@ impl<F, S> Client<F, S> where F: FnMut(&mut ConnectStream<S>, &mut VecDeque<ToSe
     }
 
 
-    fn process_socket_read(&mut self, events: &mio::Events, buf: &mut [u8], out: &mut [u8]) {
+    fn process_socket_read(&mut self, events: &mio::Events) {
         for event in events.iter() {
             trace!("Poll event on token {}", event.token().0);
             match event.token() {
@@ -274,60 +273,64 @@ impl<F, S> Client<F, S> where F: FnMut(&mut ConnectStream<S>, &mut VecDeque<ToSe
                 token => {
                     if event.is_readable() {
                         trace!("read event on token {} for TCP", token.0);
-                        let connect_stream = self.streams.get_mut(&token).unwrap();
-                    
-                        let mut received_data = vec![0; 4096];
-                        let mut bytes_read = 0;
+                        // trace!("current tokens:");
+                        // for (token, _stream) in self.streams.iter() {
+                        //     trace!("{}", token.0);
+                        // }
+                        if let Some(connect_stream) = self.streams.get_mut(&token) {
+                            let mut received_data = vec![0; 4096];
+                            let mut bytes_read = 0;
 
-                        let mut connection_closed = false;
-                        // We can (maybe) read from the connection.
-                        loop {
-                            match connect_stream.socket.read(&mut received_data[bytes_read..]) {
-                                Ok(0) => {
-                                    // Reading 0 bytes means the other side has closed the
-                                    // connection or is done writing, then so are we.
-                                    debug!("Received 0 bytes from TCP, token {}", token.0);
-                                    connection_closed = true;
-                                    break;
-                                }
-                                Ok(n) => {
-                                    bytes_read += n;
-                                    if bytes_read == received_data.len() {
-                                        received_data.resize(received_data.len() + 1024, 0);
+                            let mut connection_closed = false;
+                            // We can (maybe) read from the connection.
+                            loop {
+                                match connect_stream.socket.read(&mut received_data[bytes_read..]) {
+                                    Ok(0) => {
+                                        // Reading 0 bytes means the other side has closed the
+                                        // connection or is done writing, then so are we.
+                                        debug!("Received 0 bytes from TCP, token {}", token.0);
+                                        connection_closed = true;
+                                        break;
                                     }
-                                    debug!("Received {} bytes from TCP, token {}", n, token.0);
+                                    Ok(n) => {
+                                        bytes_read += n;
+                                        if bytes_read == received_data.len() {
+                                            received_data.resize(received_data.len() + 1024, 0);
+                                        }
+                                        debug!("Received {} bytes from TCP, token {}", n, token.0);
+                                    }
+                                    // Would block "errors" are the OS's way of saying that the
+                                    // connection is not actually ready to perform this I/O operation.
+                                    Err(ref err) if would_block(err) => break,
+                                    Err(ref err) if interrupted(err) => continue,
+                                    Err(err) => {
+                                        // Other errors we'll consider fatal.
+                                        error!("Error in reading TCP connection {}", err);
+                                        connection_closed = true;
+                                        break;
+                                    },
                                 }
-                                // Would block "errors" are the OS's way of saying that the
-                                // connection is not actually ready to perform this I/O operation.
-                                Err(ref err) if would_block(err) => break,
-                                Err(ref err) if interrupted(err) => continue,
-                                Err(err) => {
-                                    // Other errors we'll consider fatal.
-                                    error!("Error in reading TCP connection {}", err);
-                                    connection_closed = true;
-                                    break;
-                                },
                             }
-                        }
-                
-                        if bytes_read != 0 {
-                            let received_data = &received_data[..bytes_read];
-                            connect_stream.socket_read_queue.push_back(Received {
-                                receive_type: EventType::Data,
-                                data: received_data.to_vec(),
-                            });
-                            debug!("Received {} bytes, token {}", bytes_read, token.0);
-                            trace!("{}", unsafe {
-                                std::str::from_utf8_unchecked(received_data)
-                            });
-                        }
                     
-                        if connection_closed {
-                            debug!("Connection closed on token {}", token.0);
-                            connect_stream.socket_read_queue.push_back(Received {
-                                receive_type: EventType::Finished,
-                                data: vec!(),
-                            });
+                            if bytes_read != 0 {
+                                let received_data = &received_data[..bytes_read];
+                                connect_stream.socket_read_queue.push_back(Received {
+                                    receive_type: EventType::Data,
+                                    data: received_data.to_vec(),
+                                });
+                                debug!("Received {} bytes, token {}", bytes_read, token.0);
+                                trace!("{}", unsafe {
+                                    std::str::from_utf8_unchecked(received_data)
+                                });
+                            }
+                        
+                            if connection_closed {
+                                debug!("Connection closed on token {}", token.0);
+                                connect_stream.socket_read_queue.push_back(Received {
+                                    receive_type: EventType::Finished,
+                                    data: vec!(),
+                                });
+                            }
                         }
                     }
                 }
@@ -335,58 +338,48 @@ impl<F, S> Client<F, S> where F: FnMut(&mut ConnectStream<S>, &mut VecDeque<ToSe
         }
     }
 
-    fn process_socket_write(&mut self, events: &mio::Events, buf: &mut [u8], out: &mut [u8]) {
-        for event in events.iter() {
-            trace!("Poll event on token {}", event.token().0);
-            match event.token() {
-                QUIC_TOKEN => {} // ignore it
-                token => {
-                    if event.is_writable() {
-                        trace!("write event on token {} for TCP", token.0);
-                        let connect_stream = self.streams.get_mut(&token).unwrap();
-
-                        while let Some(data) = connect_stream.socket_write_queue.front() {
-                            trace!("writing to TCP connection");
-                            trace!("{}", unsafe {
-                                std::str::from_utf8_unchecked(data)
-                            });
-                            match connect_stream.socket.write(data) {
-                                // We want to write the entire `DATA` buffer in a single go. If we
-                                // write less we'll return a short write error (same as
-                                // `io::Write::write_all` does).
-                                Ok(n) => {
-                                    debug!("Sent {} bytes to {}", n, connect_stream.socket.peer_addr().unwrap());
-                                    let data = connect_stream.socket_write_queue.pop_front().unwrap();
-                                    if n < data.len() {
-                                        // short write, try remaining again
-                                        connect_stream.socket_write_queue.push_front(data[n..].to_vec());
-                                    }
-                                },
-                                // Would block "errors" are the OS's way of saying that the
-                                // connection is not actually ready to perform this I/O operation.
-                                Err(ref err) if would_block(err) => {
-                                    debug!("write() would block");
-                                    break;
-                                }
-                                // Got interrupted (how rude!), we'll try again.
-                                Err(ref err) if interrupted(err) => { 
-                                    debug!("write() interupted");
-                                    continue;
-                                }
-                                // Other errors we'll consider fatal.
-                                Err(err) => {
-                                    error!("Error in writing TCP connection {}", err);
-                                    self.remove_stream(&token);
-                                    break;
-                                }
-                            }
-
-                            // re-register to get the next writable event again
-                            self.poll.registry().reregister(&mut connect_stream.socket, token, mio::Interest::READABLE | mio::Interest::WRITABLE);
-                        } 
+    fn process_socket_write(&mut self) {
+        let mut to_remove = Vec::new();
+        'outer: for (token, connect_stream) in self.streams.iter_mut() {
+            while let Some(data) = connect_stream.socket_write_queue.front() {
+                trace!("writing to TCP connection");
+                trace!("{}", unsafe {
+                    std::str::from_utf8_unchecked(data)
+                });
+                match connect_stream.socket.write(data) {
+                    // We want to write the entire `DATA` buffer in a single go. If we
+                    // write less we'll return a short write error (same as
+                    // `io::Write::write_all` does).
+                    Ok(n) => {
+                        debug!("Sent {} bytes to {}", n, connect_stream.socket.peer_addr().unwrap());
+                        let data = connect_stream.socket_write_queue.pop_front().unwrap();
+                        if n < data.len() {
+                            // short write, try remaining again
+                            connect_stream.socket_write_queue.push_front(data[n..].to_vec());
+                        }
+                    },
+                    // Would block "errors" are the OS's way of saying that the
+                    // connection is not actually ready to perform this I/O operation.
+                    Err(ref err) if would_block(err) => {
+                        debug!("write() would block");
+                        break;
+                    }
+                    // Got interrupted (how rude!), we'll try again.
+                    Err(ref err) if interrupted(err) => { 
+                        debug!("write() interupted");
+                        continue;
+                    }
+                    // Other errors we'll consider fatal.
+                    Err(err) => {
+                        error!("Error in writing TCP connection {}", err);
+                        to_remove.push(token.clone());
+                        continue 'outer;
                     }
                 }
             }
+        }
+        for token in to_remove {
+            self.remove_stream(&token);
         }
     }
 
@@ -399,7 +392,7 @@ impl<F, S> Client<F, S> where F: FnMut(&mut ConnectStream<S>, &mut VecDeque<ToSe
             // will then proceed with the send loop.
             if events.is_empty() {
                 debug!("socket timed out");
-                self.conn.on_timeout();
+                // self.conn.on_timeout();
                 break 'read;
             }
 
@@ -631,13 +624,12 @@ fn main() {
                 loop {
                     match listener.accept() {
                         Ok((socket, _socket_addr)) => {
-                            debug!("accepted TCP connection from {}", _socket_addr);
-                            let mut state = ConnectStreamState::RequestNotSent;
                             let token = client.next_token();
+                            debug!("accepted TCP connection from {} to token id {}", _socket_addr, token.0);
                             client.add_socket(token, socket, ConnectStreamState::RequestNotSent, move |stream, to_sends| {
-                                let mut new_state = state;
+                                let mut new_state = stream.state;
                                 let mut finished = false;
-                                match state {
+                                match stream.state {
                                     ConnectStreamState::RequestNotSent => {}, // wait for final_events_handler to check
 
                                     ConnectStreamState::RequestSent => {
@@ -657,6 +649,7 @@ fn main() {
                                                             if let Ok(status_code) = status_str.parse::<i32>() {
                                                                 if status_code >= 200 && status_code < 300 {
                                                                     new_state = ConnectStreamState::ConnectionEstablished;
+                                                                    stream.socket_write_queue.push_back(b"HTTP/1.1 200 OK\r\n\r\n".to_vec());
                                                                     break;
                                                                 }
                                                             }
@@ -709,7 +702,7 @@ fn main() {
                                         }
                                     }
                                 };
-                                state = new_state;
+                                stream.state = new_state;
                                 finished
                             });
                         },

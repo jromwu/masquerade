@@ -90,7 +90,7 @@ fn main() {
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
 
-    trace!("creating socket");
+    debug!("creating socket");
 
     // Setup the event loop.
     let mut poll = mio::Poll::new().unwrap();
@@ -153,13 +153,13 @@ fn main() {
         poll.poll(&mut events, timeout).unwrap();
 
         for event in events.iter() {
-            trace!("Poll event on token {}", event.token().0);
+            debug!("Poll event on token {}", event.token().0);
             match event.token() {
                 SERVER => {} // ignore it for now, handles all read and write to QUIC later
                 token => {
-                    trace!("Poll event on token {} for TCP", event.token().0);
+                    debug!("Poll event on token {} for TCP", event.token().0);
                     let remove_token = if let Some((connection_id, stream_id)) = tcp_connections.get_by_left(&token) {
-                        trace!("Poll event on token {} for TCP connection {:?} stream {}", event.token().0, connection_id, stream_id);
+                        debug!("Poll event on token {} for TCP connection {:?} stream {}", event.token().0, connection_id, stream_id);
                         let client = clients.get_mut(connection_id).unwrap();
                         let connect_session = client.connect_streams.get_mut(stream_id).unwrap();
                         let connection = &mut connect_session.socket;
@@ -267,12 +267,12 @@ fn main() {
                         
                         if !connection_closed && event.is_writable() {
                             // TODO: if event is writable
-                            trace!("event for token {} is writable", token.0);
+                            debug!("event for token {} is writable", token.0);
                             if connect_session.state == ConnectStreamState::ConnectionEstablished {
                                 debug!("TCP connection is checked established");
 
                                 while let Some(data) = connect_session.write_queue.front() {
-                                    trace!("writing to TCP connection");
+                                    debug!("writing to TCP connection");
                                     trace!("{}", unsafe {
                                         std::str::from_utf8_unchecked(data)
                                     });
@@ -375,7 +375,7 @@ fn main() {
                 },
             };
 
-            trace!("got packet {:?}", hdr);
+            debug!("got packet {:?}", hdr);
 
             let conn_id = ring::hmac::sign(&conn_id_seed, &hdr.dcid);
             let conn_id = &conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN];
@@ -774,27 +774,32 @@ fn handle_request(
     match method {
         Some(b"CONNECT") => {
             if let Some(authority) = authority {
-                if let Ok(target_url) = url::Url::parse(authority) {
-                    let peer_addr = target_url.to_socket_addrs().unwrap().next().unwrap();
-                    match TcpStream::connect(peer_addr) {
-                        Ok(stream) => {
-                            debug!("connecting to url {} {}", target_url, target_url.to_socket_addrs().unwrap().next().unwrap());
-                            // TODO: check authorization
-                            client.connect_streams.insert(stream_id, ConnectStream { 
-                                state: ConnectStreamState::RequestReceived, 
-                                socket: stream, 
-                                write_queue: VecDeque::new() 
-                            });
-                            let token = next(current_token);
-                            poll.registry()
-                                .register(
-                                    &mut client.connect_streams.get_mut(&stream_id).unwrap().socket, 
-                                    token, 
-                                    mio::Interest::READABLE | mio::Interest::WRITABLE
-                                ).expect("poll registry register failed");
-                            tcp_connections.insert(token, (conn.source_id().into_owned(), stream_id));
-                        },
-                        Err(_) => {}, // TODO: send error
+                if let Ok(target_url) = if authority.contains("://") { url::Url::parse(authority) } else {url::Url::parse(format!("scheme://{}", authority).as_str())} {
+                    debug!("connecting to url {} from authority {}", target_url, authority);
+                    if let Ok(mut socket_addrs) = target_url.to_socket_addrs() {
+                        let peer_addr = socket_addrs.next().unwrap();
+                        match TcpStream::connect(peer_addr) {
+                            Ok(stream) => {
+                                debug!("connecting to url {} {}", target_url, target_url.to_socket_addrs().unwrap().next().unwrap());
+                                // TODO: check authorization
+                                client.connect_streams.insert(stream_id, ConnectStream { 
+                                    state: ConnectStreamState::RequestReceived, 
+                                    socket: stream, 
+                                    write_queue: VecDeque::new() 
+                                });
+                                let token = next(current_token);
+                                poll.registry()
+                                    .register(
+                                        &mut client.connect_streams.get_mut(&stream_id).unwrap().socket, 
+                                        token, 
+                                        mio::Interest::READABLE | mio::Interest::WRITABLE
+                                    ).expect("poll registry register failed");
+                                tcp_connections.insert(token, (conn.source_id().into_owned(), stream_id));
+                            },
+                            Err(_) => {}, // TODO: send error
+                        }
+                    } else {
+                        // TODO: send error
                     }
                 } else {
                     // TODO: send error
