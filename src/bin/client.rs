@@ -523,7 +523,7 @@ impl<F, S> Client<F, S> where F: FnMut(&mut ConnectStream<S>, &mut VecDeque<ToSe
                         let written = match h3_conn.send_body(&mut self.conn, to_send.stream_id, &to_send.data, false) {
                             Ok(v) => v,
             
-                            Err(quiche::h3::Error::Done) => 0, 
+                            Err(quiche::h3::Error::Done | quiche::h3::Error::StreamBlocked) => 0, 
                     
                             Err(e) => {
                                 error!("stream {} send data failed {:?}", to_send.stream_id, e);

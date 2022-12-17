@@ -2,6 +2,7 @@ pub mod threading {
 
 
 use std::{sync::{mpsc, Arc, Mutex}, thread, collections::HashMap};
+use quiche::h3::{Header};
 use log::*;
 
 /**
@@ -15,7 +16,9 @@ use log::*;
 
 #[derive(PartialEq)]
 enum EventType {
-    Headers,
+    Headers {
+        list: Vec<Header>,
+    },
     Data,
     Datagram,
     Finished,

@@ -70,14 +70,29 @@ struct PartialResponse {
     written: usize,
 }
 
+#[derive(PartialEq)]
+enum Content {
+    Headers {
+        headers: Vec<quiche::h3::Header>,
+    },
+    Data {
+        data: Vec<u8>,
+    },
+    Datagram,
+    Finished,
+}
+
+pub struct ToSend {
+    stream_id: u64, // or flow_id for DATAGRAM
+    content: Content,
+    finished: bool,
+}
+
 
 struct Client {
     conn: quiche::Connection,
-
     http3_conn: Option<quiche::h3::Connection>,
-
-    partial_responses: HashMap<u64, PartialResponse>,
-
+    h3_send_queue: VecDeque<ToSend>,
     connect_streams: HashMap<u64, ConnectStream>, // Stream ID to ConnectStream
 }
 
@@ -176,24 +191,11 @@ fn main() {
                                     quiche::h3::Header::new(b":status", b"200"),
                                     quiche::h3::Header::new(b"content-length", b"0"), // NOTE: is this needed?
                                 ];
-                                match client.http3_conn.as_mut().unwrap().send_response(&mut client.conn, *stream_id, &headers, false) {
-                                    Ok(v) => v,
-                            
-                                    Err(quiche::h3::Error::StreamBlocked) => {
-                                        // TODO: handle partial response using queue
-                                        let response = PartialResponse {
-                                            headers: Some(headers),
-                                            body: b"".to_vec(),
-                                            written: 0,
-                                        };
-                            
-                                        client.partial_responses.insert(*stream_id, response);
-                                    },
-                            
-                                    Err(e) => {
-                                        error!("{} stream send failed {:?}", client.conn.trace_id(), e);
-                                    },
-                                }
+                                client.h3_send_queue.push_back(ToSend{
+                                    content: Content::Headers { headers },
+                                    stream_id: *stream_id,
+                                    finished: false,
+                                })
                             }
                         } 
 
@@ -234,34 +236,35 @@ fn main() {
                                 let received_data = &received_data[..bytes_read];
                                 // Relay data to client
                                 debug!("Received {} bytes, connection {:?} session {}", bytes_read, connection_id, stream_id);
-                                trace!("{}", unsafe {
-                                    std::str::from_utf8_unchecked(received_data)
-                                });
-                                
-                                let written = match client.http3_conn.as_mut().unwrap().send_body(&mut client.conn, *stream_id, received_data, connection_closed) {
-                                    Ok(v) => { http_conn_closed = connection_closed; v},
-                            
-                                    Err(quiche::h3::Error::Done) => 0, // TODO: handle this
-                            
-                                    Err(e) => {
-                                        error!("connection {:?} stream {} send failed {:?}", connection_id, stream_id, e);
-                                        connection_closed = true;
-                                        0
-                                        // TODO: handle error
-                                        // return;
-                                    },
-                                };
-                            
-                                if written < received_data.len() {
-                                    // TODO: handle partial write correctly: retry next time, add a queue
-                                    error!("connection {:?} stream {} partially written {} bytes of {} bytes", connection_id, stream_id, written, received_data.len());
-                                }
-
                                 if let Ok(str_buf) = from_utf8(received_data) {
                                     debug!("Received data: {}", str_buf.trim_end());
                                 } else {
                                     debug!("Received (none UTF-8) data: {:?}", received_data);
                                 }
+                                client.h3_send_queue.push_back(ToSend{
+                                    content: Content::Data { data: received_data.to_vec() },
+                                    stream_id: *stream_id,
+                                    finished: false,
+                                })
+                                // let written = match client.http3_conn.as_mut().unwrap().send_body(&mut client.conn, *stream_id, received_data, connection_closed) {
+                                //     Ok(v) => { http_conn_closed = connection_closed; v},
+                            
+                                //     Err(quiche::h3::Error::Done) => 0, // TODO: handle this
+                            
+                                //     Err(e) => {
+                                //         error!("connection {:?} stream {} send failed {:?}", connection_id, stream_id, e);
+                                //         connection_closed = true;
+                                //         0
+                                //         // TODO: handle error
+                                //         // return;
+                                //     },
+                                // };
+                            
+                                // if written < received_data.len() {
+                                //     // TODO: handle partial write correctly: retry next time, add a queue
+                                //     error!("connection {:?} stream {} partially written {} bytes of {} bytes", connection_id, stream_id, written, received_data.len());
+                                // }
+
                             }
                         } 
                         
@@ -312,7 +315,7 @@ fn main() {
                             debug!("Connection closed on connection {:?} stream {}", connection_id, stream_id);
                             poll.registry().deregister(connection).expect("poll registry deregister failed");
                             if !http_conn_closed {
-                                client.http3_conn.as_mut().unwrap().send_body(&mut client.conn, *stream_id, b"", true); // TODO: is this correct for server to close the stream? Also, error check missing
+                                // client.http3_conn.as_mut().unwrap().send_body(&mut client.conn, *stream_id, b"", true); // TODO: is this correct for server to close the stream? Also, error check missing
                                 client.conn.stream_shutdown(*stream_id, quiche::Shutdown::Read, 0);
                             }
                             connection.shutdown(std::net::Shutdown::Both);
@@ -480,7 +483,7 @@ fn main() {
                 let client = Client {
                     conn,
                     http3_conn: None,
-                    partial_responses: HashMap::new(),
+                    h3_send_queue: VecDeque::new(),
                     connect_streams: HashMap::new(),
                 };
 
@@ -539,11 +542,6 @@ fn main() {
             }
 
             if client.http3_conn.is_some() {
-                // Handle writable streams.
-                for stream_id in client.conn.writable() {
-                    handle_writable(client, stream_id);
-                }
-
                 // Process HTTP/3 events.
                 loop {
                     let http3_conn = client.http3_conn.as_mut().unwrap();
@@ -615,18 +613,19 @@ fn main() {
                                 client.conn.trace_id(),
                                 e
                             );
-
+                            
                             break;
                         },
                     }
                 }
             }
         }
-
+        
         // Generate outgoing QUIC packets for all active connections and send
         // them on the UDP socket, until quiche reports that there are no more
         // packets to be sent.
         for client in clients.values_mut() {
+            handle_writable(client);
             loop {
                 let (write, send_info) = match client.conn.send(&mut out) {
                     Ok(v) => v,
@@ -812,46 +811,16 @@ fn handle_request(
         _ => {
             let (headers, body) = build_response(root, headers);
 
-            match http3_conn.send_response(conn, stream_id, &headers, false) {
-                Ok(v) => v,
-
-                Err(quiche::h3::Error::StreamBlocked) => {
-                    let response = PartialResponse {
-                        headers: Some(headers),
-                        body,
-                        written: 0,
-                    };
-
-                    client.partial_responses.insert(stream_id, response);
-                    return;
-                },
-
-                Err(e) => {
-                    error!("{} stream send failed {:?}", conn.trace_id(), e);
-                    return;
-                },
-            }
-
-            let written = match http3_conn.send_body(conn, stream_id, &body, true) {
-                Ok(v) => v,
-
-                Err(quiche::h3::Error::Done) => 0,
-
-                Err(e) => {
-                    error!("{} stream send failed {:?}", conn.trace_id(), e);
-                    return;
-                },
-            };
-
-            if written < body.len() {
-                let response = PartialResponse {
-                    headers: None,
-                    body,
-                    written,
-                };
-
-                client.partial_responses.insert(stream_id, response);
-            }
+            client.h3_send_queue.push_back(ToSend{
+                content: Content::Headers { headers },
+                stream_id: stream_id,
+                finished: false,
+            });
+            client.h3_send_queue.push_back(ToSend{
+                content: Content::Data { data: body },
+                stream_id: stream_id,
+                finished: true,
+            });
         },
     };
 }
@@ -899,54 +868,46 @@ fn build_response(
 }
 
 /// Handles newly writable streams.
-fn handle_writable(client: &mut Client, stream_id: u64) {
-    let conn = &mut client.conn;
-    let http3_conn = &mut client.http3_conn.as_mut().unwrap();
+fn handle_writable(client: &mut Client) {
+    if let Some(http3_conn) = client.http3_conn.as_mut() {
+        let conn = &mut client.conn;
 
-    debug!("{} stream {} is writable", conn.trace_id(), stream_id);
+        debug!("handle client {} writable", conn.trace_id());
 
-    if !client.partial_responses.contains_key(&stream_id) {
-        return;
-    }
+        while let Some(to_send) = client.h3_send_queue.pop_front() {
+            let result = match &to_send.content {
+                Content::Headers { headers } => {
+                    http3_conn.send_response(conn, to_send.stream_id, headers, to_send.finished)
+                },
+                Content::Data { data } => {
+                    match http3_conn.send_body(conn, to_send.stream_id, data, to_send.finished) {
+                        Ok(written) => {
+                            if written < data.len() {
+                                client.h3_send_queue.push_front(ToSend { stream_id: to_send.stream_id, content: Content::Data { data: data[written..].to_vec() }, finished: to_send.finished });
+                            }
+                            Ok(())
+                        }
 
-    let resp = client.partial_responses.get_mut(&stream_id).unwrap();
-
-    if let Some(ref headers) = resp.headers {
-        match http3_conn.send_response(conn, stream_id, headers, false) {
-            Ok(_) => (),
-
-            Err(quiche::h3::Error::StreamBlocked) => {
-                return;
-            },
-
-            Err(e) => {
-                error!("{} stream send failed {:?}", conn.trace_id(), e);
-                return;
-            },
+                        Err(e) => Err(e)
+                    }
+                },
+                Content::Datagram => todo!(),
+                Content::Finished => todo!(),
+            };
+            match result {
+                Ok(_) => (),
+                Err(quiche::h3::Error::StreamBlocked | quiche::h3::Error::Done) => {
+                    client.h3_send_queue.push_front(to_send);
+                    break; // TODO: should not block the whole connection?
+                },
+                Err(e) => {
+                    error!("{} stream send failed {:?}", conn.trace_id(), e);
+                    conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Read, 0);
+                    conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Write, 0);
+                    continue;
+                }
+            }
         }
-    }
-
-    resp.headers = None;
-
-    let body = &resp.body[resp.written..];
-
-    let written = match http3_conn.send_body(conn, stream_id, body, true) {
-        Ok(v) => v,
-
-        Err(quiche::h3::Error::Done) => 0,
-
-        Err(e) => {
-            client.partial_responses.remove(&stream_id);
-
-            error!("{} stream send failed {:?}", conn.trace_id(), e);
-            return;
-        },
-    };
-
-    resp.written += written;
-
-    if resp.written == resp.body.len() {
-        client.partial_responses.remove(&stream_id);
     }
 }
 
