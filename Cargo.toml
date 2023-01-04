@@ -16,7 +16,7 @@ httparse = "1.8"
 bimap = "0.6"
 
 quiche = "0.16.0"
-mio = { version = "0.8", features = ["net", "os-poll"] }
+tokio = { version = "1", features = ["full"] }
 ring = "0.16"
 
 
