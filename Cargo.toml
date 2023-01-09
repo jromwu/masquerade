@@ -13,10 +13,11 @@ log = { version = "0.4", features = ["std"] }
 env_logger = "0.10"
 url = "1"
 httparse = "1.8"
-bimap = "0.6"
 
 quiche = "0.16.0"
 tokio = { version = "1", features = ["full"] }
 ring = "0.16"
 
+[dev-dependencies]
+rand = "0.8"
 
