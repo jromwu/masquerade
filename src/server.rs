@@ -479,10 +479,7 @@ async fn handle_client(mut client: Client) {
                                                                     break
                                                                 }
                                                                 debug!("read {} bytes from UDP from {} for flow {}", read, peer_addr, flow_id);
-                                                                let context_id = encode_var_int(0);
-                                                                let mut data = Vec::with_capacity(context_id.len() + read);
-                                                                data[..context_id.len()].copy_from_slice(&context_id);
-                                                                data[context_id.len()..].copy_from_slice(&buf[..read]);
+                                                                let data = wrap_udp_connect_payload(0, &buf[..read]);
                                                                 http3_sender_clone_1.send(ToSend { stream_id: flow_id, content: Content::Datagram { payload: data }, finished: false });
                                                             }
                                                         });
@@ -491,7 +488,7 @@ async fn handle_client(mut client: Client) {
                                                                 let data = match udp_receiver.recv().await {
                                                                     Some(v) => v,
                                                                     None => {
-                                                                        debug!("UDP receiver channel closed for stream {}", stream_id);
+                                                                        debug!("UDP receiver channel closed for flow {}", flow_id);
                                                                         break
                                                                     },
                                                                 };
@@ -502,14 +499,14 @@ async fn handle_client(mut client: Client) {
                                                                 let bytes_written = match socket.send(payload).await {
                                                                     Ok(v) => v,
                                                                     Err(e) => {
-                                                                        error!("Error writing to UDP {} on stream id {}: {}", peer_addr, stream_id, e);
+                                                                        error!("Error writing to UDP {} on flow id {}: {}", peer_addr, flow_id, e);
                                                                         return
                                                                     },
                                                                 };
                                                                 if bytes_written < payload.len() {
                                                                     debug!("Partially sent {} bytes of UDP packet of length {}", bytes_written, payload.len());
                                                                 }
-                                                                debug!("written {} bytes from UDP to {} for stream {}", payload.len(), peer_addr, stream_id);
+                                                                debug!("written {} bytes from UDP to {} for flow {}", payload.len(), peer_addr, flow_id);
                                                             }
                                                         });
                                                         let headers = vec![

@@ -73,3 +73,12 @@ pub fn encode_var_int(v: u64) -> Vec<u8> {
     encoded
 }
 
+pub fn wrap_udp_connect_payload(context_id: u64, payload: &[u8]) -> Vec<u8> {
+    let context_id = encode_var_int(context_id);
+    let context_id = encode_var_int(0);
+    let mut data = Vec::with_capacity(context_id.len() + payload.len());
+    data[..context_id.len()].copy_from_slice(&context_id);
+    data[context_id.len()..].copy_from_slice(payload);
+    data
+}
+

@@ -579,225 +579,324 @@ impl Http1Client {
 }
 
 async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSender<ToSend>, connect_streams: Arc<Mutex<HashMap<u64, UnboundedSender<Content>>>>, connect_sockets: Arc<Mutex<HashMap<u64, UnboundedSender<Content>>>>) {
-    // TODO: handle a single socks5 client
     let peer_addr = stream.peer_addr().unwrap();
+    let hs_req = match socks5_proto::HandshakeRequest::read_from(&mut stream).await {
+        Ok(v) => v,
+        Err(e) => {
+            error!("socks5 handshake request read failed: {}", e);
+            return
+        }
+    };
 
-    let (mut read_half, mut write_half) = stream.into_split();
-    let mut reader = tokio_util::compat::TokioAsyncReadCompatExt::compat(read_half);
-    let mut writer = tokio_util::compat::TokioAsyncWriteCompatExt::compat_write(write_half);
-    match socksv5::read_version(&mut reader).await {
-        Ok(socksv5::SocksVersion::V5) => {
-            let handshake = match socksv5::v5::read_handshake_skip_version(&mut reader).await {
-                Ok(v) => v,
+    if hs_req.methods.contains(&socks5_proto::HandshakeMethod::None) {
+        let hs_resp = socks5_proto::HandshakeResponse::new(socks5_proto::HandshakeMethod::None);
+        match hs_resp.write_to(&mut stream).await {
+            Ok(_) => {},
+            Err(e) => {
+                error!("socks5 handshake write response failed: {}", e);
+                return
+            }
+        };
+    } else {
+        error!("No available handshake method provided by client, currently only support no auth");
+        let hs_resp = socks5_proto::HandshakeResponse::new(socks5_proto::HandshakeMethod::Unacceptable);
+        match hs_resp.write_to(&mut stream).await {
+            Ok(_) => {},
+            Err(e) => {
+                error!("socks5 handshake write response failed: {}", e);
+                return
+            }
+        };
+        let _ = stream.shutdown().await;
+        return
+    }
+
+    let req = match socks5_proto::Request::read_from(&mut stream).await {
+        Ok(v) => v,
+        Err(e) => {
+            error!("socks5 request parse failed: {}", e);
+            let resp = socks5_proto::Response::new(socks5_proto::Reply::GeneralFailure, socks5_proto::Address::unspecified());
+            match resp.write_to(&mut stream).await {
+                Ok(_) => {},
                 Err(e) => {
-                    error!("socks5 handshake error: {}", e);
+                    error!("socks5 write response failed: {}", e);
                     return
                 }
             };
+            let _ = stream.shutdown().await;
+            return
+        }
+    };
 
-            if let None = handshake
-                .methods
-                .into_iter()
-                .find(|m| *m == socksv5::v5::SocksV5AuthMethod::Noauth)
+    match req.command {
+        socks5_proto::Command::Connect => {
+            let path = socks5_addr_to_string(&req.address);
+            let headers = vec![
+                quiche::h3::Header::new(b":method", b"CONNECT"),
+                quiche::h3::Header::new(b":authority", path.as_bytes()),
+                quiche::h3::Header::new(b":authorization", b"something"),    
+            ];
+            info!("sending HTTP3 request {:?}", headers);
+            let (stream_id_sender, mut stream_id_receiver) = mpsc::channel(1);
+            let (response_sender, mut response_receiver) = mpsc::unbounded_channel::<Content>();
+            http3_sender.send(ToSend { content: Content::Request { headers, stream_id_sender }, finished: false, stream_id: 0});
+            let stream_id = stream_id_receiver.recv().await.expect("stream_id receiver error");
             {
-                error!("proxy only supports NOAUTH at the moment");
+                let mut connect_streams = connect_streams.lock().unwrap();
+                connect_streams.insert(stream_id, response_sender); 
+                // TODO: potential race condition: the response could be received before connect_streams is even inserted and get dropped
+            }
+
+            let response = response_receiver.recv().await.expect("http3 response receiver error");
+            let mut succeeded = false;
+            if let Content::Headers { headers } = response {
+                info!("Got response {:?}", hdrs_to_strings(&headers));
+                let mut status = None;
+                for hdr in headers {
+                    match hdr.name() {
+                        b":status" => status = Some(hdr.value().to_owned()),
+                        _ => (),
+                    }
+                }
+                if let Some(status) = status {
+                    if let Ok(status_str) = std::str::from_utf8(&status) {
+                        if let Ok(status_code) = status_str.parse::<i32>() {
+                            if status_code >= 200 && status_code < 300 {
+                                info!("connection established, sending OK socks response");
+                                let response = socks5_proto::Response::new(socks5_proto::Reply::Succeeded, socks5_proto::Address::unspecified());
+                                succeeded = true;
+                                match response.write_to(&mut stream).await {
+                                    Ok(_) => {},
+                                    Err(e) => {
+                                        error!("socks5 response write error: {}", e);
+                                        let _ = stream.shutdown().await;
+                                        return
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                error!("received others when expecting headers for connect");
+            }
+            if !succeeded {
+                error!("http3 CONNECT failed");
+                let response = socks5_proto::Response::new(socks5_proto::Reply::GeneralFailure, socks5_proto::Address::unspecified());
+                let _ = response.write_to(&mut stream).await;
+                let _ = stream.shutdown().await;
                 return
             }
 
-
-            match socksv5::v5::write_auth_method(&mut writer, socksv5::v5::SocksV5AuthMethod::Noauth).await {
-                Ok(_) => {},
-                Err(e) => {
-                    error!("socks5 error writing auth method: {}", e);
-                    return
-                }
-            }
-
-            let request = match socksv5::v5::read_request(&mut reader).await {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("socks5 error reading request: {}", e);
-                    return
-                }
-            };
-
-            match request.command {
-                socksv5::v5::SocksV5Command::Connect => {
-                    let host = match request.host {
-                        socksv5::v5::SocksV5Host::Ipv4(ip) => {
-                            SocketAddr::new(std::net::IpAddr::V4(ip.into()), request.port).to_string()
-                        }
-                        socksv5::v5::SocksV5Host::Ipv6(ip) => {
-                            SocketAddr::new(std::net::IpAddr::V6(ip.into()), request.port).to_string()
-                        }
-                        socksv5::v5::SocksV5Host::Domain(domain) => {
-                            let domain = match String::from_utf8(domain) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    error!("socks5 domain not utf8: {}", e);
-                                    return
-                                }
-                            };
-                            format!("{}:{}", domain, request.port)
-                            // let mut addrs = match (&domain as &str, request.port).to_socket_addrs() {
-                            //     Ok(v) => v,
-                            //     Err(e) => {
-                            //         error!("failed to resolve domain {}", domain);
-                            //         return
-                            //     }
-                            // };
-                            // let mut addr = match addrs.next() {
-                            //     Some(v) => v,
-                            //     None => {
-                            //         error!("failed to resolve domain {}", domain);
-                            //         return
-                            //     }
-                            // };
-                            // addr.set_port(request.port);
-                            // addr
-                        }
+            let (mut read_half, mut write_half) = stream.into_split();
+            let http3_sender_clone = http3_sender.clone();
+            let read_task = tokio::spawn(async move {
+                let mut buf = [0; 65535];
+                loop {
+                    let read = match read_half.read(&mut buf).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!("Error reading from TCP {}: {}", peer_addr, e);
+                            break
+                        },
                     };
-
-                    let headers = vec![
-                        quiche::h3::Header::new(b":method", b"CONNECT"),
-                        quiche::h3::Header::new(b":authority", host.as_bytes()),
-                        quiche::h3::Header::new(b":authorization", b"something"),    
-                    ];
-                    info!("sending HTTP3 request {:?}", headers);
-                    let (stream_id_sender, mut stream_id_receiver) = mpsc::channel(1);
-                    let (response_sender, mut response_receiver) = mpsc::unbounded_channel::<Content>();
-                    http3_sender.send(ToSend { content: Content::Request { headers, stream_id_sender }, finished: false, stream_id: 0});
-                    let stream_id = stream_id_receiver.recv().await.expect("stream_id receiver error");
-                    {
-                        let mut connect_streams = connect_streams.lock().unwrap();
-                        connect_streams.insert(stream_id, response_sender); 
-                        // TODO: potential race condition: the response could be received before connect_streams is even inserted and get dropped
+                    if read == 0 {
+                        debug!("TCP connection closed from {}", peer_addr);
+                        break
                     }
-                    
-                    debug!("waiting for http3 response for stream id {}", stream_id);
-                    let response = response_receiver.recv().await.expect("http3 response receiver error");
-                    let mut succeed = false;
-                    if let Content::Headers { headers } = response {
-                        info!("Got response {:?}", hdrs_to_strings(&headers));
-                        let mut status = None;
-                        for hdr in headers {
-                            match hdr.name() {
-                                b":status" => status = Some(hdr.value().to_owned()),
-                                _ => (),
+                    debug!("read {} bytes from TCP from {} for stream {}", read, peer_addr, stream_id);
+                    http3_sender_clone.send(ToSend { stream_id: stream_id, content: Content::Data { data: buf[..read].to_vec() }, finished: false });
+                }
+            });
+            let write_task = tokio::spawn(async move {
+                loop {
+                    let data = match response_receiver.recv().await {
+                        Some(v) => v,
+                        None => {
+                            debug!("TCP receiver channel closed for stream {}", stream_id);
+                            break
+                        },
+                    };
+                    match data {
+                        Content::Request { .. } => unreachable!(),
+                        Content::Headers { .. } => unreachable!(),
+                        Content::Data { data } => {
+                            let mut pos = 0;
+                            while pos < data.len() {
+                                let bytes_written = match write_half.write(&data[pos..]).await {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        error!("Error writing to TCP {} on stream id {}: {}", peer_addr, stream_id, e);
+                                        return
+                                    },
+                                };
+                                pos += bytes_written;
                             }
-                        }
-                        if let Some(status) = status {
-                            if let Ok(status_str) = std::str::from_utf8(&status) {
-                                if let Ok(status_code) = status_str.parse::<i32>() {
-                                    if status_code >= 200 && status_code < 300 {
-                                        info!("connection established, sending response");
-                                        succeed = true;
-                                        socksv5::v5::write_request_status(
-                                            &mut writer,
-                                            socksv5::v5::SocksV5RequestStatus::Success,
-                                            socksv5::v5::SocksV5Host::Ipv4([0, 0, 0, 0]),
-                                            0,
-                                        ).await;
+                            debug!("written {} bytes from TCP to {} for stream {}", data.len(), peer_addr, stream_id);
+                        },
+                        Content::Datagram { .. } => unreachable!(),
+                        Content::Finished => todo!(),
+                    };
+                    
+                }
+            });
+            tokio::join!(read_task, write_task);
+            
+            {
+                let mut connect_streams = connect_streams.lock().unwrap();
+                connect_streams.remove(&stream_id);
+            }
+        },
+        socks5_proto::Command::Associate => {
+            let path = socks5_addr_to_string(&req.address);
+            let headers = vec![
+                quiche::h3::Header::new(b":method", b"CONNECT"),
+                quiche::h3::Header::new(b":path", path.as_bytes()),
+                quiche::h3::Header::new(b":protocol", b"connect-udp"),
+                quiche::h3::Header::new(b":scheme", b"something"),
+                quiche::h3::Header::new(b":authority", b"something"),
+                quiche::h3::Header::new(b":authorization", b"something"),
+            ];
+            info!("sending HTTP3 request {:?}", headers);
+            let (stream_id_sender, mut stream_id_receiver) = mpsc::channel(1);
+            let (stream_response_sender, mut stream_response_receiver) = mpsc::unbounded_channel::<Content>();
+            let (flow_response_sender, mut flow_response_receiver) = mpsc::unbounded_channel::<Content>();
+            http3_sender.send(ToSend { content: Content::Request { headers, stream_id_sender }, finished: false, stream_id: 0});
+            let stream_id = stream_id_receiver.recv().await.expect("stream_id receiver error");
+            let flow_id = stream_id / 4;
+            {
+                let mut connect_streams = connect_streams.lock().unwrap();
+                connect_streams.insert(stream_id, stream_response_sender); 
+                // TODO: potential race condition: the response could be received before connect_streams is even inserted and get dropped
+            }
+            {
+                let mut connect_sockets = connect_sockets.lock().unwrap();
+                connect_sockets.insert(flow_id, flow_response_sender); 
+            }
+
+            let response = stream_response_receiver.recv().await.expect("http3 response receiver error");
+            let mut succeeded = false;
+            let mut socket = None;
+            if let Content::Headers { headers } = response {
+                info!("Got response {:?}", hdrs_to_strings(&headers));
+                let mut status = None;
+                for hdr in headers {
+                    match hdr.name() {
+                        b":status" => status = Some(hdr.value().to_owned()),
+                        _ => (),
+                    }
+                }
+                if let Some(status) = status {
+                    if let Ok(status_str) = std::str::from_utf8(&status) {
+                        if let Ok(status_code) = status_str.parse::<i32>() {
+                            if status_code >= 200 && status_code < 300 {
+                                info!("UDP CONNECT connection established, creating socket, sending OK socks response");
+                                if let Ok(bind_socket) = UdpSocket::bind("0.0.0.0:0").await {
+                                    if let Ok(local_addr) = bind_socket.local_addr() {
+                                        socket = Some(bind_socket);
+                                        let response = socks5_proto::Response::new(socks5_proto::Reply::Succeeded, socks5_proto::Address::SocketAddress(local_addr));
+                                        succeeded = true;
+                                        match response.write_to(&mut stream).await {
+                                            Ok(_) => {},
+                                            Err(e) => {
+                                                error!("socks5 response write error: {}", e);
+                                                let _ = stream.shutdown().await;
+                                                return
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
-                    } else {
-                        error!("received others when expecting headers for connect");
                     }
-                    if !succeed {
-                        socksv5::v5::write_request_status(
-                            &mut writer,
-                            socksv5::v5::SocksV5RequestStatus::ServerFailure,
-                            socksv5::v5::SocksV5Host::Ipv4([0, 0, 0, 0]),
-                            0,
-                        )
-                        .await;
-                        return
-                    }
+                }
+            } else {
+                error!("received others when expecting headers for connect");
+            }
+            if !succeeded {
+                error!("http3 CONNECT UDP failed");
+                let response = socks5_proto::Response::new(socks5_proto::Reply::GeneralFailure, socks5_proto::Address::unspecified());
+                let _ = response.write_to(&mut stream).await;
+                let _ = stream.shutdown().await;
+                return
+            }
+            // TODO: handle termination of UDP assoiciate correctly
 
-                    let mut read_half = reader.into_inner();
-                    let mut write_half = writer.into_inner();
-                    let http3_sender_clone = http3_sender.clone();
-                    let read_task = tokio::spawn(async move {
-                        let mut buf = [0; 65535];
-                        loop {
-                            let read = match read_half.read(&mut buf).await {
+            let socket = Arc::new(socket.unwrap());
+            let socket_clone = socket.clone();
+            let http3_sender_clone = http3_sender.clone();
+            let read_task = tokio::spawn(async move {
+                let mut buf = [0; 65535];
+                loop {
+                    let (read, recv_addr) = match socket_clone.recv_from(&mut buf).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!("Error reading from UDP socket (for socks5): {}", e);
+                            return
+                        },
+                    };
+                    debug!("read {} bytes from UDP from {} for flow {}", read, recv_addr, flow_id);
+                    if recv_addr != peer_addr {
+                        error!("received UDP packet (socks5) from {} when expecting from {}", recv_addr, peer_addr);
+                        continue
+                    }
+                    let data = wrap_udp_connect_payload(0, &buf[..read]);
+                    http3_sender_clone.send(ToSend { stream_id: flow_id, content: Content::Datagram { payload: data }, finished: false });
+                }
+            });
+            let write_task = tokio::spawn(async move {
+                loop {
+                    let data = match flow_response_receiver.recv().await {
+                        Some(v) => v,
+                        None => {
+                            debug!("receiver channel closed for flow {}", flow_id);
+                            break
+                        },
+                    };
+                    match data {
+                        Content::Request { .. } => unreachable!(),
+                        Content::Headers { .. } => unreachable!(),
+                        Content::Data { .. } => unreachable!(),
+                        Content::Datagram { payload } => {
+                            let (context_id, payload) = decode_var_int(&payload);
+                            assert_eq!(context_id, 0, "received UDP Proxying Datagram with non-zero Context ID");
+
+                            trace!("start sending on UDP");
+                            let bytes_written = match socket.send_to(payload, peer_addr).await {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    error!("Error reading from TCP {}: {}", peer_addr, e);
-                                    break
+                                    error!("Error writing to UDP {} on flow id {}: {}", peer_addr, flow_id, e);
+                                    return
                                 },
                             };
-                            if read == 0 {
-                                debug!("TCP connection closed from {}", peer_addr);
-                                break
+                            if bytes_written < payload.len() {
+                                debug!("Partially sent {} bytes of UDP packet of length {}", bytes_written, payload.len());
                             }
-                            debug!("read {} bytes from TCP from {} for stream {}", read, peer_addr, stream_id);
-                            http3_sender_clone.send(ToSend { stream_id: stream_id, content: Content::Data { data: buf[..read].to_vec() }, finished: false });
-                        }
-                    });
-                    let write_task = tokio::spawn(async move {
-                        loop {
-                            let data = match response_receiver.recv().await {
-                                Some(v) => v,
-                                None => {
-                                    debug!("TCP receiver channel closed for stream {}", stream_id);
-                                    break
-                                },
-                            };
-                            match data {
-                                Content::Request { .. } => unreachable!(),
-                                Content::Headers { .. } => unreachable!(),
-                                Content::Data { data } => {
-                                    let mut pos = 0;
-                                    while pos < data.len() {
-                                        let bytes_written = match write_half.write(&data[pos..]).await {
-                                            Ok(v) => v,
-                                            Err(e) => {
-                                                error!("Error writing to TCP {} on stream id {}: {}", peer_addr, stream_id, e);
-                                                return
-                                            },
-                                        };
-                                        pos += bytes_written;
-                                    }
-                                    debug!("written {} bytes from TCP to {} for stream {}", data.len(), peer_addr, stream_id);
-                                },
-                                Content::Datagram { .. } => unreachable!(),
-                                Content::Finished => todo!(),
-                            };
-                            
-                        }
-                    });
-                    tokio::join!(read_task, write_task);
+                            debug!("written {} bytes from UDP to {} for flow {}", payload.len(), peer_addr, flow_id);
+                        },
+                        Content::Finished => todo!(),
+                    };
                     
-                    {
-                        let mut connect_streams = connect_streams.lock().unwrap();
-                        connect_streams.remove(&stream_id);
-                    }
                 }
-                cmd => {
-                    error!("unsupported command {:?}", cmd);
-                    socksv5::v5::write_request_status(
-                        &mut writer,
-                        socksv5::v5::SocksV5RequestStatus::CommandNotSupported,
-                        socksv5::v5::SocksV5Host::Ipv4([0, 0, 0, 0]),
-                        0,
-                    )
-                    .await;
-                    return
-                }
+            });
+            tokio::join!(read_task, write_task);
+            
+            {
+                let mut connect_sockets = connect_sockets.lock().unwrap();
+                connect_sockets.remove(&flow_id);
+            }
+            {
+                let mut connect_streams = connect_streams.lock().unwrap();
+                connect_streams.remove(&stream_id);
             }
         },
-        Ok(socksv5::SocksVersion::V4) => {
-            error!("unsupported Socks version 4");
-            return
-        },
-        Err(e) => {
-            error!("Socks version error: {}", e);
-            return
-        }
+        _ => {} // process request
     }
+
+
+    
+    
+    
 }
 
 pub struct Socks5Client {
@@ -815,5 +914,12 @@ impl Socks5Client {
 
     pub async fn run(&mut self, server_addr: &String) -> Result<(), Box<dyn Error>> {
         self.client.run(server_addr, handle_socks5_stream).await
+    }
+}
+
+fn socks5_addr_to_string(addr: &socks5_proto::Address) -> String {
+    match addr {
+        socks5_proto::Address::SocketAddress(socketAddr) => socketAddr.to_string(),
+        socks5_proto::Address::DomainAddress(domain, port) => format!("{}:{}", domain, port),
     }
 }
