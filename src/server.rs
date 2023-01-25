@@ -24,7 +24,9 @@ enum Content {
     Data {
         data: Vec<u8>,
     },
-    Datagram,
+    Datagram {
+        payload: Vec<u8>,
+    },
     Finished,
 }
 
@@ -289,7 +291,8 @@ impl Server {
 
 async fn handle_client(mut client: Client) {
     let mut http3_conn: Option<quiche::h3::Connection> = None;
-    let mut connect_streams: HashMap<u64, UnboundedSender<Vec<u8>>> = HashMap::new();
+    let mut connect_streams: HashMap<u64, UnboundedSender<Vec<u8>>> = HashMap::new(); // for TCP CONNECT
+    let mut connect_sockets: HashMap<u64, UnboundedSender<Vec<u8>>> = HashMap::new(); // for CONNECT UDP
     let (http3_sender, mut http3_receiver) = mpsc::unbounded_channel::<ToSend>();
 
     let mut buf = [0; 65535];
@@ -332,7 +335,10 @@ async fn handle_client(mut client: Client) {
                                 debug!("written http3 data {} of {} bytes", written, data.len());
                             }
                         },
-                        Content::Datagram => todo!(),
+                        Content::Datagram { payload } => {
+                            debug!("sending http3 datagram of {} bytes", payload.len());
+                            http3_conn.send_dgram(&mut client.conn, to_send.stream_id, &payload)
+                        },
                         Content::Finished => todo!(),
                     };
                     match result {
@@ -414,21 +420,20 @@ async fn handle_client(mut client: Client) {
                                     stream_id
                                 );
                             
-                                // Handle CONNECT: 
-                                /*
-                                 * 0. Connect TcpStream
-                                 * 1. Add to connect_streams
-                                 * 2. Register to poll
-                                 */
-                            
                                 let mut method = None;
                                 let mut authority = None;
+                                let mut protocol = None;
+                                let mut scheme = None;
+                                let mut path = None;
                             
                                 // Look for the request's path and method.
                                 for hdr in headers.iter() {
                                     match hdr.name() {
                                         b":method" => method = Some(hdr.value()),
                                         b":authority" => authority = Some(std::str::from_utf8(hdr.value()).unwrap()),
+                                        b":protocol" => protocol = Some(hdr.value()),
+                                        b":scheme" => scheme = Some(hdr.value()),
+                                        b":path" => path = Some(hdr.value()),
                                         _ => (),
                                     }
                                 }
@@ -436,7 +441,85 @@ async fn handle_client(mut client: Client) {
                                 match method {
                                     Some(b"CONNECT") => {
                                         if let Some(authority) = authority {
-                                            if let Ok(target_url) = if authority.contains("://") { url::Url::parse(authority) } else {url::Url::parse(format!("scheme://{}", authority).as_str())} {
+                                            if protocol == Some(b"connect-udp") && scheme.is_some() && path.is_some() {
+                                                let path = path.unwrap();
+                                                if let Some(peer_addr) = path_to_socketaddr(path) {
+                                                    debug!("connecting udp to {} at {} from authority {}", std::str::from_utf8(&path).unwrap(), peer_addr, authority);
+                                                    let http3_sender_clone_1 = http3_sender.clone();
+                                                    let http3_sender_clone_2 = http3_sender.clone();
+                                                    let (udp_sender, mut udp_receiver) = mpsc::unbounded_channel::<Vec<u8>>();
+                                                    let flow_id = stream_id / 4;
+                                                    connect_sockets.insert(flow_id, udp_sender);
+                                                    tokio::spawn(async move {
+                                                        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+                                                            Ok(v) => v,
+                                                            Err(e) => {
+                                                                error!("Error binding UDP socket");
+                                                                return
+                                                            }
+                                                        };
+                                                        if socket.connect(peer_addr).await.is_err() {
+                                                            error!("Error connecting to UDP {}", peer_addr);
+                                                            return
+                                                        };
+                                                        let socket = Arc::new(socket);
+                                                        let socket_clone = socket.clone();
+                                                        let read_task = tokio::spawn(async move {
+                                                            let mut buf = [0; 65527]; // max length of UDP Proxying Payload, ref: https://www.rfc-editor.org/rfc/rfc9298.html#name-http-datagram-payload-forma
+                                                            loop {
+                                                                let read = match socket_clone.recv(&mut buf).await {
+                                                                    Ok(v) => v,
+                                                                    Err(e) => {
+                                                                        error!("Error reading from UDP {} on stream id {}: {}", peer_addr, stream_id, e);
+                                                                        break
+                                                                    },
+                                                                };
+                                                                if read == 0 {
+                                                                    debug!("UDP connection closed from {}", peer_addr); // do we need this check?
+                                                                    break
+                                                                }
+                                                                debug!("read {} bytes from UDP from {} for flow {}", read, peer_addr, flow_id);
+                                                                let context_id = encode_var_int(0);
+                                                                let mut data = Vec::with_capacity(context_id.len() + read);
+                                                                data[..context_id.len()].copy_from_slice(&context_id);
+                                                                data[context_id.len()..].copy_from_slice(&buf[..read]);
+                                                                http3_sender_clone_1.send(ToSend { stream_id: flow_id, content: Content::Datagram { payload: data }, finished: false });
+                                                            }
+                                                        });
+                                                        let write_task = tokio::spawn(async move {
+                                                            loop {
+                                                                let data = match udp_receiver.recv().await {
+                                                                    Some(v) => v,
+                                                                    None => {
+                                                                        debug!("UDP receiver channel closed for stream {}", stream_id);
+                                                                        break
+                                                                    },
+                                                                };
+                                                                let (context_id, payload) = decode_var_int(&data);
+                                                                assert_eq!(context_id, 0, "received UDP Proxying Datagram with non-zero Context ID");
+
+                                                                trace!("start sending on UDP");
+                                                                let bytes_written = match socket.send(payload).await {
+                                                                    Ok(v) => v,
+                                                                    Err(e) => {
+                                                                        error!("Error writing to UDP {} on stream id {}: {}", peer_addr, stream_id, e);
+                                                                        return
+                                                                    },
+                                                                };
+                                                                if bytes_written < payload.len() {
+                                                                    debug!("Partially sent {} bytes of UDP packet of length {}", bytes_written, payload.len());
+                                                                }
+                                                                debug!("written {} bytes from UDP to {} for stream {}", payload.len(), peer_addr, stream_id);
+                                                            }
+                                                        });
+                                                        let headers = vec![
+                                                            quiche::h3::Header::new(b":status", b"200"),
+                                                        ];
+                                                        http3_sender_clone_2.send(ToSend { stream_id, content: Content::Headers { headers }, finished: false }).expect("channel send failed");
+                                                        tokio::join!(read_task, write_task);
+                                                    });
+                                                }
+                                            } else if let Ok(target_url) = if authority.contains("://") { url::Url::parse(authority) } else {url::Url::parse(format!("scheme://{}", authority).as_str())} {
                                                 debug!("connecting to url {} from authority {}", target_url, authority);
                                                 if let Ok(mut socket_addrs) = target_url.to_socket_addrs() {
                                                     let peer_addr = socket_addrs.next().unwrap();
@@ -539,11 +622,35 @@ async fn handle_client(mut client: Client) {
                                 }
                             },
 
-                            Ok((_stream_id, quiche::h3::Event::Finished)) => (),
+                            Ok((_stream_id, quiche::h3::Event::Finished)) => (), // TODO: Add to the queue
 
-                            Ok((_stream_id, quiche::h3::Event::Reset { .. })) => (),
+                            Ok((_stream_id, quiche::h3::Event::Reset { .. })) => (), // TODO: Add to the queue
 
-                            Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
+                            Ok((flow_id, quiche::h3::Event::Datagram)) => {
+                                info!(
+                                    "{} got datagram on flow id {}",
+                                    client.conn.trace_id(),
+                                    flow_id
+                                );
+                                if connect_sockets.contains_key(&flow_id) {
+                                    match http3_conn.recv_dgram(&mut client.conn, &mut buf) {
+                                        Ok((read, recvd_flow_id, _flow_id_len)) => {
+                                            debug!("got {} bytes of datagram on flow {}", read, flow_id);
+                                            assert_eq!(flow_id, recvd_flow_id, "flow id by recv_dgram does not match");
+                                            trace!("{}", unsafe {
+                                                std::str::from_utf8_unchecked(&buf[..read])
+                                            });
+                                            let data = &buf[..read];
+                                            connect_sockets.get(&flow_id).unwrap().send(data.to_vec()).expect("channel send failed");
+                                        },
+                                        Err(e) => {
+                                            error!("error recv_dgram(): {}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                ()
+                            },
 
                             Ok((
                                 _prioritized_element_id,
@@ -595,7 +702,10 @@ async fn handle_client(mut client: Client) {
                             debug!("written http3 data {} of {} bytes", written, data.len());
                         }
                     },
-                    Content::Datagram => todo!(),
+                    Content::Datagram { payload } => {
+                        debug!("retry sending http3 datagram of {} bytes", payload.len());
+                        http3_conn.send_dgram(&mut client.conn, to_send.stream_id, &payload)
+                    },
                     Content::Finished => todo!(),
                 };
                 match result {
@@ -710,4 +820,40 @@ fn validate_token<'a>(
     }
 
     Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
+}
+
+/**
+ * Parse pseudo-header path for CONNECT UDP to SocketAddr
+ */
+fn path_to_socketaddr(path: &[u8]) -> Option<net::SocketAddr> {
+    // for now, let's assume path pattern is "/something.../target-host/target-port/"
+    let mut split_iter = std::io::BufRead::split(path, b'/');
+    let mut second_last = None;
+    let mut last = None;
+    while let Some(curr) = split_iter.next() {
+        if let Ok(curr) = curr {
+            second_last = last;
+            last = Some(curr);
+        } else {
+            return None
+        }
+    }
+    if second_last.is_some() && last.is_some() {
+        let second_last = second_last.unwrap();
+        let last = last.unwrap();
+        let second_last = std::str::from_utf8(&second_last);
+        let last = std::str::from_utf8(&last);
+        if second_last.is_ok() && last.is_ok() {
+            let url_str = format!("scheme://{}:{}/", second_last.unwrap(), last.unwrap());
+            let url = url::Url::parse(&url_str);
+            if let Ok(url) = url {
+                let socket_addrs = url.to_socket_addrs();
+                if let Ok(mut socket_addrs) = socket_addrs {
+                    return socket_addrs.next()
+                }
+            }
+        }
+    }
+
+    None
 }

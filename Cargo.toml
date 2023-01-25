@@ -12,11 +12,15 @@ crate-type = ["lib"]   # The crate types to generate.
 log = { version = "0.4", features = ["std"] }
 env_logger = "0.10"
 url = "1"
-httparse = "1.8"
 
 quiche = "0.16.0"
 tokio = { version = "1", features = ["full"] }
 ring = "0.16"
+
+httparse = "1.8"
+socksv5 = "0.3"
+
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [dev-dependencies]
 rand = "0.8"

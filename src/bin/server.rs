@@ -5,7 +5,7 @@ use std::error::Error;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::init();
+    env_logger::builder().format_timestamp_millis().init();
     
     let bind_addr = env::args()
         .nth(1)

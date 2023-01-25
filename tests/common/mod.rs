@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::time::Duration;
 
-use masquerade::client::Client;
+use masquerade::client::Http1Client;
 use masquerade::server::Server;
 
 use log::*;
@@ -12,7 +12,7 @@ use rand::RngCore;
 
 pub const TIMEOUT_DURATION: Duration = Duration::from_secs(5);
 
-pub async fn setup() -> Result<(TcpStream, TcpStream), Box<dyn Error>> {
+pub async fn setup_http1_client() -> Result<(TcpStream, TcpStream), Box<dyn Error>> {
     // set up a tunnel: first TCP socket <-> listen_addr <--masquerade--> server_addr <-> second TCP socket
 
     let listen_addr = "127.0.0.1:8899".to_string();
@@ -21,7 +21,7 @@ pub async fn setup() -> Result<(TcpStream, TcpStream), Box<dyn Error>> {
     let mut server = Server::new(&server_addr);
     server.bind().await?;
 
-    let mut client = Client::new(&listen_addr);
+    let mut client = Http1Client::new(&listen_addr);
     client.bind().await?;
 
     let server_task = tokio::spawn(async move {
