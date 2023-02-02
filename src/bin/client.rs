@@ -21,8 +21,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| "http".to_string());
     
     match protocol.as_str() {
-        "http" => Http1Client::new(&bind_addr).run(&server_name).await,
-        "socks5" => Socks5Client::new(&bind_addr).run(&server_name).await,
+        "http" => {
+            let mut client = Http1Client::new();
+            client.bind(bind_addr).await?;
+            client.run(&server_name).await
+        },
+        "socks5" => {
+            let mut client = Socks5Client::new();
+            client.bind(bind_addr).await?;
+            client.run(&server_name).await
+        },
         _ => {
             error!("not supported protocol");
             Ok(())

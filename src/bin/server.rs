@@ -11,7 +11,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:4433".to_string());
     
-    let server = Server::new(&bind_addr);
+    let mut server = Server::new();
+    server.bind(bind_addr).await?;
 
     server.run().await
 }

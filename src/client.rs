@@ -43,24 +43,40 @@ struct ToSend {
     finished: bool,
 }
 
+#[derive(Debug, Clone)]
+struct RunBeforeBindError;
+
+impl std::fmt::Display for RunBeforeBindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "bind(listen_addr) has to be called before run()")
+    }
+}
+impl Error for RunBeforeBindError {}
+
 struct Client {
-    bind_addr: String,
     listener: Option<TcpListener>,
 }
 
 
 impl Client {
-    pub fn new(bind_addr: &String) -> Client {
-        Client { bind_addr: bind_addr.clone(), listener: None }
+    pub fn new() -> Client {
+        Client { listener: None }
     }
 
-    pub async fn bind(&mut self) -> Result<(), Box<dyn Error>> {
+    /**
+     * returns None if client is not bound to a socket yet
+     */
+    pub fn listen_addr(&self) -> Option<SocketAddr> {
+        return self.listener.as_ref().map(|listener| listener.local_addr().unwrap())
+    }
+
+    pub async fn bind<T: tokio::net::ToSocketAddrs>(&mut self, bind_addr: T) -> Result<(), Box<dyn Error>> {
         debug!("creating TCP listener");
 
-        let mut listener = TcpListener::bind(self.bind_addr.clone().parse::<SocketAddr>().unwrap()).await?;
+        let mut listener = TcpListener::bind(bind_addr).await?;
+        debug!("listening on {}", listener.local_addr().unwrap());
+        
         self.listener = Some(listener);
-
-        debug!("listening on {}", self.bind_addr);
         Ok(())
     }
     
@@ -70,11 +86,11 @@ impl Client {
         Fut: Future<Output = ()> + Send + 'static,
     {
         if self.listener.is_none() {
-            self.bind().await?;
+            return Err(Box::new(RunBeforeBindError));
         }
         let listener = self.listener.as_mut().unwrap();
 
-        let server_name = format!("https://{}", server_addr);
+        let server_name = format!("https://{}", server_addr); // TODO: avoid duplicate https://
     
         // Resolve server address.
         let url = url::Url::parse(&server_name).unwrap();
@@ -565,12 +581,16 @@ pub struct Http1Client {
 }
 
 impl Http1Client {
-    pub fn new(bind_addr: &String) -> Http1Client {
-        Http1Client { client: Client::new(bind_addr) }
+    pub fn new() -> Http1Client {
+        Http1Client { client: Client::new() }
     }
 
-    pub async fn bind(&mut self) -> Result<(), Box<dyn Error>> {
-        self.client.bind().await
+    pub fn listen_addr(&self) -> Option<SocketAddr> {
+        return self.client.listen_addr()
+    }
+
+    pub async fn bind<T: tokio::net::ToSocketAddrs>(&mut self, bind_addr: T) -> Result<(), Box<dyn Error>> {
+        self.client.bind(bind_addr).await
     }
 
     pub async fn run(&mut self, server_addr: &String) -> Result<(), Box<dyn Error>> {
@@ -904,12 +924,16 @@ pub struct Socks5Client {
 }
 
 impl Socks5Client {
-    pub fn new(bind_addr: &String) -> Socks5Client {
-        Socks5Client { client: Client::new(bind_addr) }
+    pub fn new() -> Socks5Client {
+        Socks5Client { client: Client::new() }
     }
 
-    pub async fn bind(&mut self) -> Result<(), Box<dyn Error>> {
-        self.client.bind().await
+    pub fn listen_addr(&self) -> Option<SocketAddr> {
+        return self.client.listen_addr()
+    }
+
+    pub async fn bind<T: tokio::net::ToSocketAddrs>(&mut self, bind_addr: T) -> Result<(), Box<dyn Error>> {
+        self.client.bind(bind_addr).await
     }
 
     pub async fn run(&mut self, server_addr: &String) -> Result<(), Box<dyn Error>> {

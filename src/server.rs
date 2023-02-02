@@ -1,7 +1,7 @@
 use log::*;
 use quiche::h3::NameValue;
 
-use std::net;
+use std::net::{self, SocketAddr};
 use std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use std::error::Error;
@@ -42,6 +42,16 @@ struct QuicReceived {
     data: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct RunBeforeBindError;
+
+impl std::fmt::Display for RunBeforeBindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "bind(listen_addr) has to be called before run()")
+    }
+}
+impl Error for RunBeforeBindError {}
+
 struct Client {
     conn: quiche::Connection,
     quic_receiver: mpsc::UnboundedReceiver<QuicReceived>,
@@ -51,32 +61,37 @@ struct Client {
 type ClientMap = HashMap<quiche::ConnectionId<'static>, mpsc::UnboundedSender<QuicReceived>>;
 
 pub struct Server {
-    listen_addr: String,
-    socket: Option<UdpSocket>,
+    socket: Option<Arc<UdpSocket>>,
 }
 
 impl Server {
-    pub fn new(listen_addr: &String) -> Server {
-        Server { listen_addr: listen_addr.clone(), socket: None }
+    pub fn new() -> Server {
+        Server { socket: None }
     }
 
-    pub async fn bind(&mut self) -> Result<(), Box<dyn Error>> {
+    /**
+     * returns None if server is not bound to a socket yet
+     */
+    pub fn listen_addr(&self) -> Option<SocketAddr> {
+        return self.socket.clone().map(|socket| socket.local_addr().unwrap())
+    }
+
+    pub async fn bind<T: tokio::net::ToSocketAddrs>(&mut self, listen_addr: T) -> Result<(), Box<dyn Error>> {
         debug!("creating UDP socket");
     
         // Create the UDP listening socket, and register it with the event loop.
-        let socket = UdpSocket::bind(self.listen_addr.clone()).await?;
-        self.socket = Some(socket);
-
-        debug!("listening on {}", self.listen_addr);
+        let socket = UdpSocket::bind(listen_addr).await?;
+        debug!("listening on {}", socket.local_addr().unwrap());
+        
+        self.socket = Some(Arc::new(socket));
         Ok(())
     }
 
-    pub async fn run(mut self) -> Result<(), Box<dyn Error>> {
+    pub async fn run(&self) -> Result<(), Box<dyn Error>> {
         if self.socket.is_none() {
-            self.bind().await?;
+            return Err(Box::new(RunBeforeBindError))
         }
-        let socket = self.socket.unwrap();
-        let socket = Arc::new(socket);
+        let socket = self.socket.clone().unwrap();
 
         let mut buf = [0; 65535];
         let mut out = [0; MAX_DATAGRAM_SIZE];
