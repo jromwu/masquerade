@@ -22,4 +22,5 @@ socks5-proto = "0.3"
 
 [dev-dependencies]
 rand = "0.8"
-
+env_logger = "*"
+test-log = "0.2"

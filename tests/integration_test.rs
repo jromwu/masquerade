@@ -12,10 +12,8 @@ mod common;
 /**
  * Simple test with single stream in a single QUIC connection. No multiplexing.
  */
-#[tokio::test]
+#[test_log::test(tokio::test)]
 async fn end_to_end_http1_tcp_test() {
-    env_logger::builder().is_test(true).try_init();
-
     let timeout_duration = Duration::from_secs(5);    
 
     let (mut client_stream, mut server_stream) = timeout(timeout_duration, common::setup_http1_client()).await.unwrap().unwrap();
@@ -31,13 +29,11 @@ async fn end_to_end_http1_tcp_test() {
 /**
  * Simple test with single stream in a single QUIC connection. No multiplexing.
  */
-#[tokio::test]
+#[test_log::test(tokio::test)]
 async fn end_to_end_socks5_tcp_test() {
-    env_logger::builder().is_test(true).try_init();
-
     let timeout_duration = Duration::from_secs(5);    
 
-    let (mut client_stream, mut server_stream) = timeout(timeout_duration, common::setup_socks5_client()).await.unwrap().unwrap();
+    let (mut client_stream, mut server_stream) = timeout(timeout_duration, common::setup_socks5_tcp_client()).await.unwrap().unwrap();
     
     let (mut client_stream, mut server_stream) =  common::assert_stream_connected(client_stream, server_stream, 74783).await;
     let (mut client_stream, mut server_stream) = common::assert_stream_connected(server_stream, client_stream, 84783).await;
@@ -47,5 +43,19 @@ async fn end_to_end_socks5_tcp_test() {
     // TODO: graceful exit
 }
 
+
+/**
+ * Simple test with single stream in a single QUIC connection. No multiplexing.
+ */
+#[test_log::test(tokio::test)]
+async fn end_to_end_socks5_udp_test() {
+    let timeout_duration = Duration::from_secs(5);    
+
+    let mut client_socket = timeout(timeout_duration, common::setup_socks5_udp_client()).await.unwrap().unwrap();
+    
+    common::assert_socks5_socket_connected(&client_socket, 1000).await;
+
+    // TODO: graceful exit
+}
 
 

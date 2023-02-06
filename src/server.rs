@@ -110,7 +110,8 @@ impl Server {
             .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
             .unwrap();
     
-        config.set_max_idle_timeout(10000);
+        // TODO: allow custom configuration of the following parameters and also consider the defaults more carefully
+        config.set_max_idle_timeout(1000);
         config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
         config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
         config.set_initial_max_data(10_000_000);
@@ -120,6 +121,7 @@ impl Server {
         config.set_initial_max_streams_bidi(100);
         config.set_initial_max_streams_uni(100);
         config.set_disable_active_migration(true);
+        config.enable_dgram(true, 1000, 1000); 
         config.enable_early_data();
     
         let rng = SystemRandom::new();
@@ -646,13 +648,13 @@ async fn handle_client(mut client: Client) {
                                 );
                                 if connect_sockets.contains_key(&flow_id) {
                                     match http3_conn.recv_dgram(&mut client.conn, &mut buf) {
-                                        Ok((read, recvd_flow_id, _flow_id_len)) => {
-                                            debug!("got {} bytes of datagram on flow {}", read, flow_id);
+                                        Ok((read, recvd_flow_id, flow_id_len)) => {
+                                            debug!("got {} bytes of datagram on flow {}", read - flow_id_len, flow_id);
                                             assert_eq!(flow_id, recvd_flow_id, "flow id by recv_dgram does not match");
                                             trace!("{}", unsafe {
-                                                std::str::from_utf8_unchecked(&buf[..read])
+                                                std::str::from_utf8_unchecked(&buf[flow_id_len..read])
                                             });
-                                            let data = &buf[..read];
+                                            let data = &buf[flow_id_len..read];
                                             connect_sockets.get(&flow_id).unwrap().send(data.to_vec()).expect("channel send failed");
                                         },
                                         Err(e) => {

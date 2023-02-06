@@ -57,28 +57,24 @@ const MAX_INT_LEN_1: u64 = u64::pow(2, 6) - 1;
 
 pub fn encode_var_int(v: u64) -> Vec<u8> {
     assert!(v <= MAX_VAR_INT);
-    let length = if v > MAX_INT_LEN_4 {
-        8
+    let (prefix, length) = if v > MAX_INT_LEN_4 {
+        (3, 8)
     } else if v > MAX_INT_LEN_2 {
-        4
+        (2, 4) 
     } else if v > MAX_INT_LEN_1 {
-        2
+        (1, 2)
     } else {
-        1
+        (0, 1)
     };
 
-    let mut encoded = v.to_be_bytes().to_vec();
-    let prefix: u8 = length << 6;
+    let mut encoded = v.to_be_bytes()[..length].to_vec();
+    let prefix: u8 = prefix << 6;
     encoded[0] = encoded[0] | prefix;
     encoded
 }
 
 pub fn wrap_udp_connect_payload(context_id: u64, payload: &[u8]) -> Vec<u8> {
     let context_id = encode_var_int(context_id);
-    let context_id = encode_var_int(0);
-    let mut data = Vec::with_capacity(context_id.len() + payload.len());
-    data[..context_id.len()].copy_from_slice(&context_id);
-    data[context_id.len()..].copy_from_slice(payload);
-    data
+    [&context_id, payload].concat()
 }
 

@@ -1,5 +1,3 @@
-use log::*;
-
 use quiche;
 use quiche::h3::{NameValue, Header};
 use ring::rand::*;
@@ -7,7 +5,7 @@ use ring::rand::*;
 use std::future::Future;
 use std::net::{ToSocketAddrs, SocketAddr};
 use std::collections::HashMap;
-use std::error::Error;
+use std::error::{Error, self};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,6 +13,8 @@ use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::net::{UdpSocket, TcpStream, TcpListener};
 use tokio::sync::mpsc::{self, UnboundedSender, UnboundedReceiver};
 use tokio::time;
+
+use log::*;
 
 use crate::common::*;
 
@@ -112,7 +112,7 @@ impl Client {
     
         config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL).unwrap();
         
-        config.set_max_idle_timeout(10000);
+        config.set_max_idle_timeout(1000);
         config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
         config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
         config.set_initial_max_data(10_000_000);
@@ -122,6 +122,8 @@ impl Client {
         config.set_initial_max_streams_bidi(100);
         config.set_initial_max_streams_uni(100);
         config.set_disable_active_migration(true);
+        config.enable_dgram(true, 1000, 1000); 
+
     
         let mut scid = [0; quiche::MAX_CONN_ID_LEN];
         let rng = SystemRandom::new();
@@ -231,11 +233,11 @@ impl Client {
                                     let connect_sockets = connect_sockets.lock().unwrap();
                                     if let Some(sender) = connect_sockets.get(&flow_id) {
                                         match http3_conn.recv_dgram(&mut conn, &mut buf) {
-                                            Ok((read, recvd_flow_id, _flow_id_len)) => {
+                                            Ok((read, recvd_flow_id, flow_id_len)) => {
                                                 debug!("got {} bytes of datagram on flow {}", read, flow_id);
                                                 assert_eq!(flow_id, recvd_flow_id, "flow id by recv_dgram does not match");
-                                                trace!("{}", unsafe {std::str::from_utf8_unchecked(&buf[..read])});
-                                                sender.send(Content::Datagram { payload: buf[..read].to_vec() });
+                                                trace!("{}", unsafe {std::str::from_utf8_unchecked(&buf[flow_id_len..read])});
+                                                sender.send(Content::Datagram { payload: buf[flow_id_len..read].to_vec() });
                                             },
                                             Err(e) => {
                                                 error!("error recv_dgram(): {}", e);
@@ -768,149 +770,170 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
             }
         },
         socks5_proto::Command::Associate => {
-            let path = socks5_addr_to_string(&req.address);
-            let headers = vec![
-                quiche::h3::Header::new(b":method", b"CONNECT"),
-                quiche::h3::Header::new(b":path", path.as_bytes()),
-                quiche::h3::Header::new(b":protocol", b"connect-udp"),
-                quiche::h3::Header::new(b":scheme", b"something"),
-                quiche::h3::Header::new(b":authority", b"something"),
-                quiche::h3::Header::new(b":authorization", b"something"),
-            ];
-            info!("sending HTTP3 request {:?}", headers);
-            let (stream_id_sender, mut stream_id_receiver) = mpsc::channel(1);
-            let (stream_response_sender, mut stream_response_receiver) = mpsc::unbounded_channel::<Content>();
-            let (flow_response_sender, mut flow_response_receiver) = mpsc::unbounded_channel::<Content>();
-            http3_sender.send(ToSend { content: Content::Request { headers, stream_id_sender }, finished: false, stream_id: 0});
-            let stream_id = stream_id_receiver.recv().await.expect("stream_id receiver error");
-            let flow_id = stream_id / 4;
-            {
-                let mut connect_streams = connect_streams.lock().unwrap();
-                connect_streams.insert(stream_id, stream_response_sender); 
-                // TODO: potential race condition: the response could be received before connect_streams is even inserted and get dropped
-            }
-            {
-                let mut connect_sockets = connect_sockets.lock().unwrap();
-                connect_sockets.insert(flow_id, flow_response_sender); 
-            }
-
-            let response = stream_response_receiver.recv().await.expect("http3 response receiver error");
-            let mut succeeded = false;
-            let mut socket = None;
-            if let Content::Headers { headers } = response {
-                info!("Got response {:?}", hdrs_to_strings(&headers));
-                let mut status = None;
-                for hdr in headers {
-                    match hdr.name() {
-                        b":status" => status = Some(hdr.value().to_owned()),
-                        _ => (),
-                    }
-                }
-                if let Some(status) = status {
-                    if let Ok(status_str) = std::str::from_utf8(&status) {
-                        if let Ok(status_code) = status_str.parse::<i32>() {
-                            if status_code >= 200 && status_code < 300 {
-                                info!("UDP CONNECT connection established, creating socket, sending OK socks response");
-                                if let Ok(bind_socket) = UdpSocket::bind("0.0.0.0:0").await {
-                                    if let Ok(local_addr) = bind_socket.local_addr() {
-                                        socket = Some(bind_socket);
-                                        let response = socks5_proto::Response::new(socks5_proto::Reply::Succeeded, socks5_proto::Address::SocketAddress(local_addr));
-                                        succeeded = true;
-                                        match response.write_to(&mut stream).await {
-                                            Ok(_) => {},
-                                            Err(e) => {
-                                                error!("socks5 response write error: {}", e);
-                                                let _ = stream.shutdown().await;
-                                                return
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+            // NOTE: Currently do not support fragmentation
+            let mut local_addr = stream.local_addr().unwrap(); // bind on the same ip address of the tcp connection
+            local_addr.set_port(0); // let the OS assign a port
+            if let Ok(bind_socket) = UdpSocket::bind(local_addr).await { 
+                if let Ok(local_addr) = bind_socket.local_addr() {
+                    let response = socks5_proto::Response::new(socks5_proto::Reply::Succeeded, socks5_proto::Address::SocketAddress(local_addr));
+                    match response.write_to(&mut stream).await {
+                        Ok(_) => {},
+                        Err(e) => {
+                            error!("socks5 response write error: {}", e);
+                            let _ = stream.shutdown().await;
+                            return
                         }
                     }
+                    let bind_socket = Arc::new(bind_socket);
+                    let http3_sender_clone = http3_sender.clone();
+                    let listen_task = tokio::spawn(async move {
+                        let mut buf = [0; 65535];
+                        let mut dest_to_flow: HashMap<socks5_proto::Address, u64> = HashMap::new();
+                        loop {
+                            match bind_socket.recv_from(&mut buf).await {
+                                Ok((read, recv_addr)) => {
+                                    debug!("read {} bytes from UDP from {}", read, recv_addr);
+                                    let socks5_udp_header = match socks5_proto::UdpHeader::read_from(&mut &buf[..read]).await {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            error!("udp socks5 socket received packet cannot be parsed: {}", e);
+                                            continue
+                                        },
+                                    };
+                                    let payload = &buf[socks5_udp_header.serialized_len()..read];
+                                    let flow_id = match dest_to_flow.get(&socks5_udp_header.address) {
+                                        Some(flow_id) => {
+                                            *flow_id
+                                        },
+                                        None => {
+                                            // New destination address to proxy, set up connect-udp flow
+                                            let path = socks5_addr_to_connect_udp_path(&socks5_udp_header.address);
+                                            let headers = vec![
+                                                quiche::h3::Header::new(b":method", b"CONNECT"),
+                                                quiche::h3::Header::new(b":path", path.as_bytes()),
+                                                quiche::h3::Header::new(b":protocol", b"connect-udp"),
+                                                quiche::h3::Header::new(b":scheme", b"dummy-scheme"),
+                                                quiche::h3::Header::new(b":authority", b"dummy-authority"),
+                                                quiche::h3::Header::new(b":authorization", b"dummy-authorization"),
+                                            ];
+                                            debug!("sending HTTP3 request {:?}", headers);
+                                            let (stream_id_sender, mut stream_id_receiver) = mpsc::channel(1);
+                                            let (stream_response_sender, mut stream_response_receiver) = mpsc::unbounded_channel::<Content>();
+                                            let (flow_response_sender, mut flow_response_receiver) = mpsc::unbounded_channel::<Content>();
+                                            http3_sender.send(ToSend { content: Content::Request { headers, stream_id_sender }, finished: false, stream_id: 0});
+                                            let stream_id = stream_id_receiver.recv().await.expect("stream_id receiver error");
+                                            let flow_id = stream_id / 4;
+                                            {
+                                                let mut connect_streams = connect_streams.lock().unwrap();
+                                                connect_streams.insert(stream_id, stream_response_sender); 
+                                                // TODO: potential race condition: the response could be received before connect_streams is even inserted and get dropped
+                                            }
+                                            {
+                                                let mut connect_sockets = connect_sockets.lock().unwrap();
+                                                connect_sockets.insert(flow_id, flow_response_sender); 
+                                            }
+                                            let mut succeeded = false;
+                                            let response = stream_response_receiver.recv().await.expect("http3 response receiver error");
+                                            if let Content::Headers { headers } = response {
+                                                debug!("Got response {:?}", hdrs_to_strings(&headers));
+                                                let mut status = None;
+                                                for hdr in headers {
+                                                    match hdr.name() {
+                                                        b":status" => status = Some(hdr.value().to_owned()),
+                                                        _ => (),
+                                                    }
+                                                }
+                                                if let Some(status) = status {
+                                                    if let Ok(status_str) = std::str::from_utf8(&status) {
+                                                        if let Ok(status_code) = status_str.parse::<i32>() {
+                                                            if status_code >= 200 && status_code < 300 {
+                                                                succeeded = true;
+                                                                debug!("UDP CONNECT connection established for flow {}", flow_id);
+                                                                dest_to_flow.insert(socks5_udp_header.address, flow_id);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                error!("received others when expecting headers for connect");
+                                            }
+                                            if !succeeded {
+                                                error!("http3 CONNECT UDP failed");
+                                                continue
+                                            }
+                                            let bind_socket_clone = bind_socket.clone();
+                                            let _write_task = tokio::spawn(async move {
+                                                loop {
+                                                    let data = match flow_response_receiver.recv().await {
+                                                        Some(v) => v,
+                                                        None => {
+                                                            debug!("receiver channel closed for flow {}", flow_id);
+                                                            break
+                                                        },
+                                                    };
+                                                    match data {
+                                                        Content::Request { .. } => unreachable!(),
+                                                        Content::Headers { .. } => unreachable!(),
+                                                        Content::Data { .. } => unreachable!(),
+                                                        Content::Datagram { payload } => {
+                                                            trace!("raw UDP datagram is {} bytes long", payload.len());
+                                                            let (context_id, payload) = decode_var_int(&payload);
+                                                            trace!("UDP datagram payload without context id is {} bytes long", payload.len());
+                                                            assert_eq!(context_id, 0, "received UDP Proxying Datagram with non-zero Context ID");
+                                
+                                                            let udp_header = socks5_proto::UdpHeader::new(0, socks5_proto::Address::SocketAddress("0.0.0.0:0".parse().unwrap()));
+                                                            trace!("appending SOCKS5 UDP request header of length {}", udp_header.serialized_len());
+                                                            let mut serialized_udp_header = Vec::new();
+                                                            udp_header.write_to_buf(&mut serialized_udp_header);
+                                                            trace!("SOCKS5 UDP request header: {:02x?}", serialized_udp_header);
+                                                            let payload = [&serialized_udp_header, payload].concat();
+                                                            trace!("start sending on UDP");
+                                                            let bytes_written = match bind_socket_clone.send_to(&payload, recv_addr).await {
+                                                                Ok(v) => v,
+                                                                Err(e) => {
+                                                                    error!("Error writing to UDP {} on flow id {}: {}", recv_addr, flow_id, e);
+                                                                    continue
+                                                                },
+                                                            };
+                                                            if bytes_written < payload.len() {
+                                                                debug!("Partially sent {} bytes of UDP packet of length {}", bytes_written, payload.len());
+                                                            }
+                                                            debug!("written {} bytes from UDP to {} for flow {}", payload.len(), recv_addr, flow_id);
+                                                        },
+                                                        Content::Finished => todo!(),
+                                                    };
+                                                    
+                                                }
+                                            });
+                                            flow_id
+                                        },
+                                    };
+                                    debug!("sending {} bytes of data to flow {}", payload.len(), flow_id);
+                                    let data = wrap_udp_connect_payload(0, payload);
+                                    http3_sender_clone.send(ToSend { stream_id: flow_id, content: Content::Datagram { payload: data }, finished: false });
+                                },
+                                Err(e) => {
+                                    error!("udp socks5 socket recv failed: {}", e);
+                                    break
+                                },
+                            }
+                        }
+                    });
+                    tokio::join!(listen_task);
                 }
-            } else {
-                error!("received others when expecting headers for connect");
-            }
-            if !succeeded {
-                error!("http3 CONNECT UDP failed");
-                let response = socks5_proto::Response::new(socks5_proto::Reply::GeneralFailure, socks5_proto::Address::unspecified());
-                let _ = response.write_to(&mut stream).await;
-                let _ = stream.shutdown().await;
-                return
             }
             // TODO: handle termination of UDP assoiciate correctly
-
-            let socket = Arc::new(socket.unwrap());
-            let socket_clone = socket.clone();
-            let http3_sender_clone = http3_sender.clone();
-            let read_task = tokio::spawn(async move {
-                let mut buf = [0; 65535];
-                loop {
-                    let (read, recv_addr) = match socket_clone.recv_from(&mut buf).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            error!("Error reading from UDP socket (for socks5): {}", e);
-                            return
-                        },
-                    };
-                    debug!("read {} bytes from UDP from {} for flow {}", read, recv_addr, flow_id);
-                    if recv_addr != peer_addr {
-                        error!("received UDP packet (socks5) from {} when expecting from {}", recv_addr, peer_addr);
-                        continue
-                    }
-                    let data = wrap_udp_connect_payload(0, &buf[..read]);
-                    http3_sender_clone.send(ToSend { stream_id: flow_id, content: Content::Datagram { payload: data }, finished: false });
-                }
-            });
-            let write_task = tokio::spawn(async move {
-                loop {
-                    let data = match flow_response_receiver.recv().await {
-                        Some(v) => v,
-                        None => {
-                            debug!("receiver channel closed for flow {}", flow_id);
-                            break
-                        },
-                    };
-                    match data {
-                        Content::Request { .. } => unreachable!(),
-                        Content::Headers { .. } => unreachable!(),
-                        Content::Data { .. } => unreachable!(),
-                        Content::Datagram { payload } => {
-                            let (context_id, payload) = decode_var_int(&payload);
-                            assert_eq!(context_id, 0, "received UDP Proxying Datagram with non-zero Context ID");
-
-                            trace!("start sending on UDP");
-                            let bytes_written = match socket.send_to(payload, peer_addr).await {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    error!("Error writing to UDP {} on flow id {}: {}", peer_addr, flow_id, e);
-                                    return
-                                },
-                            };
-                            if bytes_written < payload.len() {
-                                debug!("Partially sent {} bytes of UDP packet of length {}", bytes_written, payload.len());
-                            }
-                            debug!("written {} bytes from UDP to {} for flow {}", payload.len(), peer_addr, flow_id);
-                        },
-                        Content::Finished => todo!(),
-                    };
-                    
-                }
-            });
-            tokio::join!(read_task, write_task);
             
-            {
-                let mut connect_sockets = connect_sockets.lock().unwrap();
-                connect_sockets.remove(&flow_id);
-            }
-            {
-                let mut connect_streams = connect_streams.lock().unwrap();
-                connect_streams.remove(&stream_id);
-            }
+            // {
+            //     let mut connect_sockets = connect_sockets.lock().unwrap();
+            //     connect_sockets.remove(&flow_id);
+            // }
+            // {
+            //     let mut connect_streams = connect_streams.lock().unwrap();
+            //     connect_streams.remove(&stream_id);
+            // }
         },
-        _ => {} // process request
+        socks5_proto::Command::Bind => unimplemented!(),
     }
 
 
@@ -943,7 +966,22 @@ impl Socks5Client {
 
 fn socks5_addr_to_string(addr: &socks5_proto::Address) -> String {
     match addr {
-        socks5_proto::Address::SocketAddress(socketAddr) => socketAddr.to_string(),
+        socks5_proto::Address::SocketAddress(socket_addr) => socket_addr.to_string(),
         socks5_proto::Address::DomainAddress(domain, port) => format!("{}:{}", domain, port),
     }
+}
+
+/**
+ * RFC9298 specify connect-udp path should be a template like /.well-known/masque/udp/192.0.2.6/443/
+ */
+fn socks5_addr_to_connect_udp_path(addr: &socks5_proto::Address) -> String {
+    let (host, port) = match addr {
+        socks5_proto::Address::SocketAddress(socket_addr) => {
+            let ip_string = socket_addr.ip().to_string();
+            ip_string.replace(":", "%3A"); // encode ':' in IPv6 address in URI
+            (ip_string, socket_addr.port())
+        },
+        socks5_proto::Address::DomainAddress(domain, port) => (domain.to_owned(), port.to_owned()),
+    };
+    format!("/.well_known/masque/udp/{}/{}/", host, port)
 }
