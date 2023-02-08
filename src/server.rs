@@ -52,6 +52,9 @@ impl std::fmt::Display for RunBeforeBindError {
 }
 impl Error for RunBeforeBindError {}
 
+/**
+ * Client for each QUIC connection
+ */
 struct Client {
     conn: quiche::Connection,
     quic_receiver: mpsc::UnboundedReceiver<QuicReceived>,
@@ -70,12 +73,15 @@ impl Server {
     }
 
     /**
-     * returns None if server is not bound to a socket yet
+     * Get the socket address the server is bound to. Returns None if server is not bound to a socket yet
      */
     pub fn listen_addr(&self) -> Option<SocketAddr> {
         return self.socket.clone().map(|socket| socket.local_addr().unwrap())
     }
 
+    /**
+     * Bind the server to listen to an address
+     */
     pub async fn bind<T: tokio::net::ToSocketAddrs>(&mut self, listen_addr: T) -> Result<(), Box<dyn Error>> {
         debug!("creating UDP socket");
     
@@ -305,7 +311,9 @@ impl Server {
 }
 
 
-
+/**
+ * Client handler that handles the connection for a single client
+ */
 async fn handle_client(mut client: Client) {
     let mut http3_conn: Option<quiche::h3::Connection> = None;
     let mut connect_streams: HashMap<u64, UnboundedSender<Vec<u8>>> = HashMap::new(); // for TCP CONNECT
@@ -323,6 +331,7 @@ async fn handle_client(mut client: Client) {
     let mut interval = time::interval(Duration::from_millis(20));
     loop {
         tokio::select! {
+            // Send pending HTTP3 data in channel to HTTP3 connection on QUIC
             http3_to_send = http3_receiver.recv(), if http3_conn.is_some() && http3_retry_send.is_none() => {
                 if http3_to_send.is_none() {
                     unreachable!()
@@ -377,6 +386,8 @@ async fn handle_client(mut client: Client) {
                     };
                 }
             },
+
+            // handle QUIC received data
             recvd = client.quic_receiver.recv() => {
                 match recvd {
                     Some(mut quic_received) => {
@@ -691,6 +702,7 @@ async fn handle_client(mut client: Client) {
                 }
             },
 
+            // Retry sending in case of stream blocking
             _ = interval.tick(), if http3_conn.is_some() && http3_retry_send.is_some() => {
                 let mut to_send = http3_retry_send.unwrap();
                 let http3_conn = http3_conn.as_mut().unwrap();
@@ -753,6 +765,7 @@ async fn handle_client(mut client: Client) {
             },
             else => break,
         }
+        // Send pending QUIC packets
         loop {
             let (write, send_info) = match client.conn.send(&mut out) {
                 Ok(v) => v,

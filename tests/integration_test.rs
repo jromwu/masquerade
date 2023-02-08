@@ -9,6 +9,8 @@ use std::time::Duration;
 
 mod common;
 
+// TODO: gracefully exit the tests (implement Drop for server and clients)
+
 /**
  * Simple test with single stream in a single QUIC connection. No multiplexing.
  */
@@ -22,8 +24,6 @@ async fn end_to_end_http1_tcp_test() {
     let (mut client_stream, mut server_stream) = common::assert_stream_connected(server_stream, client_stream, 84783).await;
     let (mut client_stream, mut server_stream) = common::assert_stream_connected(server_stream, client_stream, 84783).await;
     let (mut client_stream, mut server_stream) =  common::assert_stream_connected(client_stream, server_stream, 84783).await;
-
-    // TODO: graceful exit
 }
 
 /**
@@ -39,13 +39,11 @@ async fn end_to_end_socks5_tcp_test() {
     let (mut client_stream, mut server_stream) = common::assert_stream_connected(server_stream, client_stream, 84783).await;
     let (mut client_stream, mut server_stream) = common::assert_stream_connected(server_stream, client_stream, 84783).await;
     let (mut client_stream, mut server_stream) =  common::assert_stream_connected(client_stream, server_stream, 84783).await;
-
-    // TODO: graceful exit
 }
 
 
 /**
- * Simple test with single stream in a single QUIC connection. No multiplexing.
+ * Simple test with single stream and single flow in a single QUIC connection. No multiplexing.
  */
 #[test_log::test(tokio::test)]
 async fn end_to_end_socks5_udp_test() {
@@ -54,8 +52,6 @@ async fn end_to_end_socks5_udp_test() {
     let mut client_socket = timeout(timeout_duration, common::setup_socks5_udp_client()).await.unwrap().unwrap();
     
     common::assert_socks5_socket_connected(&client_socket, 1000).await;
-
-    // TODO: graceful exit
 }
 
 

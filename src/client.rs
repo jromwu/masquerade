@@ -70,6 +70,9 @@ impl Client {
         return self.listener.as_ref().map(|listener| listener.local_addr().unwrap())
     }
 
+    /**
+     * Bind the server to listen to an address
+     */
     pub async fn bind<T: tokio::net::ToSocketAddrs>(&mut self, bind_addr: T) -> Result<(), Box<dyn Error>> {
         debug!("creating TCP listener");
 
@@ -80,6 +83,14 @@ impl Client {
         Ok(())
     }
     
+    /**
+     * Run client to receive TCP connections at the binded address, and handle 
+     * incoming streams with stream_handler (e.g. handshake, negotiation, proxying traffic)
+     * 
+     * This enables any protocol that accepts TCP connection to start with, such as HTTP1.1
+     * CONNECT and SOCKS5 as implemented below. Similarly, UDP listening can be easily 
+     * added if necessary.
+     */
     pub async fn run<F, Fut>(&mut self, server_addr: &String, mut stream_handler: F) -> Result<(), Box<dyn Error>> 
     where
         F: FnMut(TcpStream, UnboundedSender<ToSend>, Arc<Mutex<HashMap<u64, UnboundedSender<Content>>>>, Arc<Mutex<HashMap<u64, UnboundedSender<Content>>>>) -> Fut,
@@ -164,6 +175,7 @@ impl Client {
             }
     
             tokio::select! {
+                // handle QUIC received data
                 recvd = socket.recv_from(&mut buf) => {
                     let (read, from) = match recvd {
                         Ok(v) => v,
@@ -266,6 +278,7 @@ impl Client {
                         }
                     }
                 },
+                // Send pending HTTP3 data in channel to HTTP3 connection on QUIC
                 http3_to_send = http3_receiver.recv(), if http3_conn.is_some() && http3_retry_send.is_none() => {
                     if http3_to_send.is_none() {
                         unreachable!()
@@ -333,6 +346,8 @@ impl Client {
                         };
                     }
                 },
+
+                // Accept a new TCP connection
                 tcp_accepted = listener.accept() => {
                     match tcp_accepted {
                         Ok((tcp_socket, addr)) => {
@@ -343,6 +358,7 @@ impl Client {
                     };
                 },
 
+                // Retry sending in case of stream blocking
                 _ = interval.tick(), if http3_conn.is_some() && http3_retry_send.is_some() => {
                     let mut to_send = http3_retry_send.unwrap();
                     let http3_conn = http3_conn.as_mut().unwrap();
@@ -415,6 +431,7 @@ impl Client {
                     .expect("Unable to create HTTP/3 connection, check the server's uni stream limit and window size"),
                 );
             }
+        // Send pending QUIC packets
             loop {
                 let (write, send_info) = match conn.send(&mut out) {
                     Ok(v) => v,
@@ -476,7 +493,7 @@ async fn handle_http1_stream(mut stream: TcpStream, http3_sender: UnboundedSende
                 let headers = vec![
                     quiche::h3::Header::new(b":method", b"CONNECT"),
                     quiche::h3::Header::new(b":authority", path.as_bytes()),
-                    quiche::h3::Header::new(b":authorization", b"something"),    
+                    quiche::h3::Header::new(b":authorization", b"dummy-authorization"),    
                 ];
                 info!("sending HTTP3 request {:?}", headers);
                 let (stream_id_sender, mut stream_id_receiver) = mpsc::channel(1);
@@ -656,7 +673,7 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
             let headers = vec![
                 quiche::h3::Header::new(b":method", b"CONNECT"),
                 quiche::h3::Header::new(b":authority", path.as_bytes()),
-                quiche::h3::Header::new(b":authorization", b"something"),    
+                quiche::h3::Header::new(b":authorization", b"dummy-authorization"),    
             ];
             info!("sending HTTP3 request {:?}", headers);
             let (stream_id_sender, mut stream_id_receiver) = mpsc::channel(1);
