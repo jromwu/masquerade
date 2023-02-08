@@ -1,12 +1,17 @@
 [package]
 name = "masquerade"
-version = "0.1.0"
 edition = "2021"
+version = "0.1.0"
+license = "MIT"
+keywords = ["masque", "proxy"]
+categories = ["network-programming"]
+description = "A implementation of MASQUE based on RFC 9114, 9227, and 9228"
+homepage = "https://github.com/jromwu/masquerade"
+repository = "https://github.com/jromwu/masquerade"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
-crate-type = ["lib"]   # The crate types to generate.
+crate-type = ["lib"]
 
 [dependencies]
 log = { version = "0.4", features = ["std"] }
