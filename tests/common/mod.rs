@@ -2,10 +2,9 @@ use std::error::Error;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-use masquerade::client::{Http1Client, Socks5Client};
-use masquerade::server::Server;
+use masquerade_proxy::client::{Http1Client, Socks5Client};
+use masquerade_proxy::server::Server;
 
-use tokio::net::unix::SocketAddr;
 use tokio::net::{TcpStream, TcpSocket, TcpListener, UdpSocket};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::time::timeout;

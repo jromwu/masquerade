@@ -1,4 +1,4 @@
-use masquerade::server::Server;
+use masquerade_proxy::server::Server;
 
 use std::env;
 use std::error::Error;

@@ -1,5 +1,5 @@
 [package]
-name = "masquerade"
+name = "masquerade-proxy"
 edition = "2021"
 version = "0.1.0"
 license = "MIT"

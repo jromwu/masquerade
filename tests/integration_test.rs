@@ -1,5 +1,5 @@
-use masquerade::client;
-use masquerade::server;
+use masquerade_proxy::client;
+use masquerade_proxy::server;
 
 use log::*;
 use tokio::net::{TcpStream, TcpSocket, TcpListener};
