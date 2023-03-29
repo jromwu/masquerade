@@ -204,6 +204,7 @@ impl Client {
                     if let Some(http3_conn) = &mut http3_conn {
                         // Process HTTP/3 events.
                         loop {
+                            debug!("polling on http3 connection");
                             match http3_conn.poll(&mut conn) {
                                 Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                                     info!("got response headers {:?} on stream id {}", hdrs_to_strings(&list), stream_id);
@@ -214,6 +215,7 @@ impl Client {
                                 },
             
                                 Ok((stream_id, quiche::h3::Event::Data)) => {
+                                    debug!("received stream data");
                                     let connect_streams = connect_streams.lock().unwrap();
                                     if let Some(sender) = connect_streams.get(&stream_id) {
                                         while let Ok(read) = http3_conn.recv_body(&mut conn, stream_id, &mut buf) {
@@ -240,16 +242,22 @@ impl Client {
                                     }
                                 },
             
-                                Ok((flow_id, quiche::h3::Event::Datagram)) => {
-                                    debug!("got {} bytes of datagram on flow {}", read, flow_id);
-                                    let connect_sockets = connect_sockets.lock().unwrap();
-                                    if let Some(sender) = connect_sockets.get(&flow_id) {
+                                Ok((_flow_id, quiche::h3::Event::Datagram)) => {
+                                    loop {
                                         match http3_conn.recv_dgram(&mut conn, &mut buf) {
-                                            Ok((read, recvd_flow_id, flow_id_len)) => {
-                                                debug!("got {} bytes of datagram on flow {}", read, flow_id);
-                                                assert_eq!(flow_id, recvd_flow_id, "flow id by recv_dgram does not match");
+                                            Ok((read, flow_id, flow_id_len)) => {
+                                                let connect_sockets = connect_sockets.lock().unwrap();
+                                                debug!("got {} bytes of datagram on flow {} ({})", read, flow_id, _flow_id);
                                                 trace!("{}", unsafe {std::str::from_utf8_unchecked(&buf[flow_id_len..read])});
-                                                sender.send(Content::Datagram { payload: buf[flow_id_len..read].to_vec() });
+                                                if let Some(sender) = connect_sockets.get(&flow_id) {
+                                                    sender.send(Content::Datagram { payload: buf[flow_id_len..read].to_vec() });
+                                                } else {
+                                                    debug!("received datagram on unknown flow: {}", flow_id)
+                                                }
+                                            },
+                                            Err(quiche::h3::Error::Done) => {
+                                                debug!("done recv_dgram");
+                                                break;
                                             },
                                             Err(e) => {
                                                 error!("error recv_dgram(): {}", e);
@@ -266,12 +274,12 @@ impl Client {
                                 },
             
                                 Err(quiche::h3::Error::Done) => {
+                                    debug!("poll done");
                                     break;
                                 },
             
                                 Err(e) => {
                                     error!("HTTP/3 processing failed: {:?}", e);
-            
                                     break;
                                 },
                             }
@@ -319,7 +327,7 @@ impl Client {
                                 }
                             },
                             Content::Datagram { payload } => {
-                                debug!("sending http3 datagram of {} bytes", payload.len());
+                                debug!("sending http3 datagram of {} bytes to flow {}", payload.len(), to_send.stream_id);
                                 http3_conn.send_dgram(&mut conn, to_send.stream_id, &payload)
                             },
                             Content::Finished => todo!(),
@@ -866,7 +874,7 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
                                                             if status_code >= 200 && status_code < 300 {
                                                                 succeeded = true;
                                                                 debug!("UDP CONNECT connection established for flow {}", flow_id);
-                                                                dest_to_flow.insert(socks5_udp_header.address, flow_id);
+                                                                dest_to_flow.insert(socks5_udp_header.address.clone(), flow_id);
                                                             }
                                                         }
                                                     }
@@ -879,6 +887,7 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
                                                 continue
                                             }
                                             let bind_socket_clone = bind_socket.clone();
+                                            let dest_addr = socks5_udp_header.address.clone();
                                             let _write_task = tokio::spawn(async move {
                                                 loop {
                                                     let data = match flow_response_receiver.recv().await {
@@ -898,7 +907,7 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
                                                             trace!("UDP datagram payload without context id is {} bytes long", payload.len());
                                                             assert_eq!(context_id, 0, "received UDP Proxying Datagram with non-zero Context ID");
                                 
-                                                            let udp_header = socks5_proto::UdpHeader::new(0, socks5_proto::Address::SocketAddress("0.0.0.0:0".parse().unwrap()));
+                                                            let udp_header = socks5_proto::UdpHeader::new(0, dest_addr.clone());
                                                             trace!("appending SOCKS5 UDP request header of length {}", udp_header.serialized_len());
                                                             let mut serialized_udp_header = Vec::new();
                                                             udp_header.write_to_buf(&mut serialized_udp_header);

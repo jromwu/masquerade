@@ -362,7 +362,7 @@ async fn handle_client(mut client: Client) {
                             }
                         },
                         Content::Datagram { payload } => {
-                            debug!("sending http3 datagram of {} bytes", payload.len());
+                            debug!("sending http3 datagram of {} bytes to flow {}", payload.len(), to_send.stream_id);
                             http3_conn.send_dgram(&mut client.conn, to_send.stream_id, &payload)
                         },
                         Content::Finished => todo!(),
@@ -651,22 +651,25 @@ async fn handle_client(mut client: Client) {
 
                             Ok((_stream_id, quiche::h3::Event::Reset { .. })) => (), // TODO: Add to the queue
 
-                            Ok((flow_id, quiche::h3::Event::Datagram)) => {
-                                info!(
-                                    "{} got datagram on flow id {}",
-                                    client.conn.trace_id(),
-                                    flow_id
-                                );
-                                if connect_sockets.contains_key(&flow_id) {
+                            Ok((_flow_id, quiche::h3::Event::Datagram)) => {
+                                loop {
                                     match http3_conn.recv_dgram(&mut client.conn, &mut buf) {
-                                        Ok((read, recvd_flow_id, flow_id_len)) => {
-                                            debug!("got {} bytes of datagram on flow {}", read - flow_id_len, flow_id);
-                                            assert_eq!(flow_id, recvd_flow_id, "flow id by recv_dgram does not match");
+                                        Ok((read, flow_id, flow_id_len)) => {
+                                            debug!("got {} bytes of datagram on flow {} ({})", read - flow_id_len, flow_id, _flow_id);
+                                            // assert_eq!(flow_id, recvd_flow_id, "flow id by recv_dgram does not match");
                                             trace!("{}", unsafe {
                                                 std::str::from_utf8_unchecked(&buf[flow_id_len..read])
                                             });
-                                            let data = &buf[flow_id_len..read];
-                                            connect_sockets.get(&flow_id).unwrap().send(data.to_vec()).expect("channel send failed");
+                                            if connect_sockets.contains_key(&flow_id) {
+                                                let data = &buf[flow_id_len..read];
+                                                connect_sockets.get(&flow_id).unwrap().send(data.to_vec()).expect("channel send failed");
+                                            } else {
+                                                debug!("received datagram on unknown flow: {}", flow_id)
+                                            }
+                                        },
+                                        Err(quiche::h3::Error::Done) => {
+                                            debug!("done recv_dgram");
+                                            break;
                                         },
                                         Err(e) => {
                                             error!("error recv_dgram(): {}", e);
