@@ -49,7 +49,7 @@ async fn end_to_end_socks5_tcp_test() {
 async fn end_to_end_socks5_udp_test() {
     let timeout_duration = Duration::from_secs(5);    
 
-    let mut client_socket = timeout(timeout_duration, common::setup_socks5_udp_client()).await.unwrap().unwrap();
+    let (client_socket, _client_stream) = timeout(timeout_duration, common::setup_socks5_udp_client()).await.unwrap().unwrap();
     
     common::assert_socks5_socket_connected(&client_socket, 1000).await;
 }

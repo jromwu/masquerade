@@ -836,6 +836,7 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
                     let bind_socket = Arc::new(bind_socket);
                     let http3_sender_clone = http3_sender.clone();
                     let mut stream_ids: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+                    let mut stream_ids_clone = stream_ids.clone();
                     let connect_streams_clone = connect_streams.clone();
                     let connect_sockets_clone = connect_sockets.clone();
                    
@@ -885,7 +886,10 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
                                                 let mut connect_sockets = connect_sockets.lock().unwrap();
                                                 connect_sockets.insert(flow_id, flow_response_sender); 
                                             }
-                                            
+                                            {
+                                                let mut stream_ids = stream_ids_clone.lock().unwrap();
+                                                stream_ids.push(stream_id);
+                                            }
                                             let mut succeeded = false;
                                             let response = stream_response_receiver.recv().await.expect("http3 response receiver error");
                                             if let Content::Headers { headers } = response {
@@ -991,6 +995,7 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
                                 error!("udp associate control stream read error: {}", e);
                             }
                         }
+                        debug!("Socks5 TCP connection on {} associated with UDP sockets terminated", local_addr);
                         {
                             let stream_ids = stream_ids.lock().unwrap();
                             let mut connect_streams = connect_streams_clone.lock().unwrap();

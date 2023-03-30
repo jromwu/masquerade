@@ -140,7 +140,10 @@ pub async fn setup_socks5_tcp_client() -> Result<(TcpStream, TcpStream), Box<dyn
     Ok((client_stream, server_stream))
 }
 
-pub async fn setup_socks5_udp_client() -> Result<UdpSocket, Box<dyn Error>> {
+/**
+ * The connected TCP stream cannot be dropped or the connection will terminate
+ */
+pub async fn setup_socks5_udp_client() -> Result<(UdpSocket, TcpStream), Box<dyn Error>> {
     // set up a tunnel: local UDP socket <-> bind_addr <--masquerade--> server_addr <-> remote UDP socket
     // note: SOCKS5 does not proxy UDP packets as it is. It requires a header attached to packets in/out the local socket
     let mut server = Server::new();
@@ -188,7 +191,7 @@ pub async fn setup_socks5_udp_client() -> Result<UdpSocket, Box<dyn Error>> {
     let local_socket = UdpSocket::bind("127.0.0.1:0").await?;
     local_socket.connect((bind_ip, bind_port)).await?;
     
-    Ok(local_socket)
+    Ok((local_socket, client_stream))
 }
 
 async fn socks5_handshake_no_auth(stream: &mut TcpStream) -> Result<(), Box<dyn Error>> {
