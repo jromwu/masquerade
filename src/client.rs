@@ -217,11 +217,13 @@ impl Client {
                                 Ok((stream_id, quiche::h3::Event::Data)) => {
                                     debug!("received stream data");
                                     let connect_streams = connect_streams.lock().unwrap();
-                                    if let Some(sender) = connect_streams.get(&stream_id) {
-                                        while let Ok(read) = http3_conn.recv_body(&mut conn, stream_id, &mut buf) {
+                                    while let Ok(read) = http3_conn.recv_body(&mut conn, stream_id, &mut buf) {
+                                        if let Some(sender) = connect_streams.get(&stream_id) {
                                             debug!("got {} bytes of response data on stream {}", read, stream_id);
                                             trace!("{}", unsafe {std::str::from_utf8_unchecked(&buf[..read])});
                                             sender.send(Content::Data { data: buf[..read].to_vec() });
+                                        } else {
+                                            debug!("received {} bytes of stream data on unknown stream {}", read, stream_id);
                                         }
                                     }
                                 },

@@ -632,8 +632,8 @@ async fn handle_client(mut client: Client) {
                                     client.conn.trace_id(),
                                     stream_id
                                 );
-                                if connect_streams.contains_key(&stream_id) {
-                                    while let Ok(read) = http3_conn.recv_body(&mut client.conn, stream_id, &mut buf) {
+                                while let Ok(read) = http3_conn.recv_body(&mut client.conn, stream_id, &mut buf) {
+                                    if connect_streams.contains_key(&stream_id) {
                                         debug!(
                                             "got {} bytes of data on stream {}",
                                             read, stream_id
@@ -643,13 +643,21 @@ async fn handle_client(mut client: Client) {
                                         });
                                         let data = &buf[..read];
                                         connect_streams.get(&stream_id).unwrap().send(data.to_vec()).expect("channel send failed");
+                                    } else {
+                                        debug!("received {} bytes of stream data on unknown stream {}", read, stream_id);
                                     }
                                 }
                             },
 
-                            Ok((_stream_id, quiche::h3::Event::Finished)) => (), // TODO: Add to the queue
+                            Ok((stream_id, quiche::h3::Event::Finished)) => {
+                                info!("finished received, stream id: {} closing", stream_id);
+                                // TODO: Add to the queue
+                            }, 
 
-                            Ok((_stream_id, quiche::h3::Event::Reset { .. })) => (), // TODO: Add to the queue
+                            Ok((stream_id, quiche::h3::Event::Reset(e))) => {
+                                error!("request was reset by peer with {}, stream id: {} closed", e, stream_id);
+                                // TODO: Add to the queue
+                            }, 
 
                             Ok((_flow_id, quiche::h3::Event::Datagram)) => {
                                 loop {
@@ -683,21 +691,16 @@ async fn handle_client(mut client: Client) {
                             Ok((
                                 _prioritized_element_id,
                                 quiche::h3::Event::PriorityUpdate,
-                            )) => (),
+                            )) => unreachable!(),
 
-                            Ok((_goaway_id, quiche::h3::Event::GoAway)) => (),
+                            Ok((_goaway_id, quiche::h3::Event::GoAway)) => unreachable!(),
 
                             Err(quiche::h3::Error::Done) => {
                                 break;
                             },
 
                             Err(e) => {
-                                error!(
-                                    "{} HTTP/3 error {:?}",
-                                    client.conn.trace_id(),
-                                    e
-                                );
-                                
+                                error!("{} HTTP/3 error {:?}", client.conn.trace_id(), e);
                                 break;
                             },
                         }
