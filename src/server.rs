@@ -365,7 +365,13 @@ async fn handle_client(mut client: Client) {
                             debug!("sending http3 datagram of {} bytes to flow {}", payload.len(), to_send.stream_id);
                             http3_conn.send_dgram(&mut client.conn, to_send.stream_id, &payload)
                         },
-                        Content::Finished => todo!(),
+                        Content::Finished => {
+                            debug!("terminating stream {}", to_send.stream_id);
+                            client.conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Read, 0);
+                            client.conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Write, 0);
+                            connect_streams.remove(&to_send.stream_id);
+                            Ok(())
+                        },
                     };
                     match result {
                         Ok(_) => {},
@@ -376,6 +382,7 @@ async fn handle_client(mut client: Client) {
                         },
                         Err(e) => {
                             error!("Connection {} stream {} send failed {:?}", client.conn.trace_id(), to_send.stream_id, e);
+                            client.conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Read, 0);
                             client.conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Write, 0);
                             connect_streams.remove(&to_send.stream_id);
                         }
@@ -579,6 +586,7 @@ async fn handle_client(mut client: Client) {
                                                                 debug!("read {} bytes from TCP from {} for stream {}", read, peer_addr, stream_id);
                                                                 http3_sender_clone_1.send(ToSend { stream_id: stream_id, content: Content::Data { data: buf[..read].to_vec() }, finished: false });
                                                             }
+                                                            http3_sender_clone_1.send(ToSend { stream_id: stream_id, content: Content::Finished, finished: true });
                                                         });
                                                         let write_task = tokio::spawn(async move {
                                                             loop {
@@ -651,12 +659,18 @@ async fn handle_client(mut client: Client) {
 
                             Ok((stream_id, quiche::h3::Event::Finished)) => {
                                 info!("finished received, stream id: {} closing", stream_id);
-                                // TODO: Add to the queue
+                                // TODO: do we need to shutdown the stream on our side?
+                                if connect_streams.contains_key(&stream_id) {
+                                    connect_streams.remove(&stream_id);
+                                }
                             }, 
 
                             Ok((stream_id, quiche::h3::Event::Reset(e))) => {
                                 error!("request was reset by peer with {}, stream id: {} closed", e, stream_id);
-                                // TODO: Add to the queue
+                                // TODO: do we need to shutdown the stream on our side?
+                                if connect_streams.contains_key(&stream_id) {
+                                    connect_streams.remove(&stream_id);
+                                }
                             }, 
 
                             Ok((_flow_id, quiche::h3::Event::Datagram)) => {
@@ -750,6 +764,7 @@ async fn handle_client(mut client: Client) {
                     },
                     Err(e) => {
                         error!("Connection {} stream {} send failed {:?}", client.conn.trace_id(), to_send.stream_id, e);
+                        client.conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Read, 0);
                         client.conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Write, 0);
                         connect_streams.remove(&to_send.stream_id);
                         http3_retry_send = None;

@@ -230,17 +230,19 @@ impl Client {
             
                                 Ok((stream_id, quiche::h3::Event::Finished)) => {
                                     info!("finished received, stream id: {} closing", stream_id);
-                                    let connect_streams = connect_streams.lock().unwrap();
+                                    let mut connect_streams = connect_streams.lock().unwrap();
                                     if let Some(sender) = connect_streams.get(&stream_id) {
                                         sender.send(Content::Finished {});
+                                        connect_streams.remove(&stream_id);
                                     }
                                 },
             
                                 Ok((stream_id, quiche::h3::Event::Reset(e))) => {
                                     error!("request was reset by peer with {}, stream id: {} closed", e, stream_id);
-                                    let connect_streams = connect_streams.lock().unwrap();
+                                    let mut connect_streams = connect_streams.lock().unwrap();
                                     if let Some(sender) = connect_streams.get(&stream_id) {
                                         sender.send(Content::Finished {});
+                                        connect_streams.remove(&stream_id);
                                     }
                                 },
             
@@ -332,7 +334,17 @@ impl Client {
                                 debug!("sending http3 datagram of {} bytes to flow {}", payload.len(), to_send.stream_id);
                                 http3_conn.send_dgram(&mut conn, to_send.stream_id, &payload)
                             },
-                            Content::Finished => todo!(),
+                            Content::Finished => {
+                                debug!("shutting down stream");
+                                conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Read, 0);
+                                match conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Write, 0) {
+                                    Ok(v) => Ok(v),
+                                    Err(e) => {
+                                        error!("stream shutdown failed: {}", e);
+                                        Ok(()) // ignore the error
+                                    } 
+                                }
+                            },
                         };
                         match result {
                             Ok(_) => {},
@@ -343,6 +355,7 @@ impl Client {
                             },
                             Err(e) => {
                                 error!("Connection {} stream {} send failed {:?}", conn.trace_id(), to_send.stream_id, e);
+                                conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Read, 0);
                                 conn.stream_shutdown(to_send.stream_id, quiche::Shutdown::Write, 0);
                                 {
                                     let mut connect_streams = connect_streams.lock().unwrap();
@@ -408,7 +421,7 @@ impl Client {
                             debug!("retry sending http3 datagram of {} bytes", payload.len());
                             http3_conn.send_dgram(&mut conn, to_send.stream_id, &payload)
                         },
-                        Content::Finished => todo!(),
+                        Content::Finished => unreachable!(),
                     };
                     match result {
                         Ok(_) => {
@@ -508,7 +521,7 @@ async fn handle_http1_stream(mut stream: TcpStream, http3_sender: UnboundedSende
                 info!("sending HTTP3 request {:?}", headers);
                 let (stream_id_sender, mut stream_id_receiver) = mpsc::channel(1);
                 let (response_sender, mut response_receiver) = mpsc::unbounded_channel::<Content>();
-                http3_sender.send(ToSend { content: Content::Request { headers, stream_id_sender }, finished: false, stream_id: 0});
+                http3_sender.send(ToSend { content: Content::Request { headers, stream_id_sender }, finished: false, stream_id: u64::MAX});
                 let stream_id = stream_id_receiver.recv().await.expect("stream_id receiver error");
                 {
                     let mut connect_streams = connect_streams.lock().unwrap();
@@ -554,6 +567,7 @@ async fn handle_http1_stream(mut stream: TcpStream, http3_sender: UnboundedSende
                         };
                         if read == 0 {
                             debug!("TCP connection closed from {}", peer_addr);
+                            http3_sender_clone.send(ToSend { stream_id: stream_id, content: Content::Finished, finished: false });
                             break
                         }
                         debug!("read {} bytes from TCP from {} for stream {}", read, peer_addr, stream_id);
@@ -587,17 +601,20 @@ async fn handle_http1_stream(mut stream: TcpStream, http3_sender: UnboundedSende
                                 debug!("written {} bytes from TCP to {} for stream {}", data.len(), peer_addr, stream_id);
                             },
                             Content::Datagram { .. } => unreachable!(),
-                            Content::Finished => todo!(),
+                            Content::Finished =>  {
+                                debug!("shutting down stream in write task");
+                                break;
+                            },
                         };
                         
                     }
                 });
                 tokio::join!(read_task, write_task);
                 
-                {
-                    let mut connect_streams = connect_streams.lock().unwrap();
-                    connect_streams.remove(&stream_id);
-                }
+                // {
+                //     let mut connect_streams = connect_streams.lock().unwrap();
+                //     connect_streams.remove(&stream_id);
+                // }
                 return
             }
         }
@@ -688,7 +705,7 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
             info!("sending HTTP3 request {:?}", headers);
             let (stream_id_sender, mut stream_id_receiver) = mpsc::channel(1);
             let (response_sender, mut response_receiver) = mpsc::unbounded_channel::<Content>();
-            http3_sender.send(ToSend { content: Content::Request { headers, stream_id_sender }, finished: false, stream_id: 0});
+            http3_sender.send(ToSend { content: Content::Request { headers, stream_id_sender }, finished: false, stream_id: u64::MAX});
             let stream_id = stream_id_receiver.recv().await.expect("stream_id receiver error");
             {
                 let mut connect_streams = connect_streams.lock().unwrap();
@@ -784,7 +801,10 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
                             debug!("written {} bytes from TCP to {} for stream {}", data.len(), peer_addr, stream_id);
                         },
                         Content::Datagram { .. } => unreachable!(),
-                        Content::Finished => todo!(),
+                        Content::Finished => {
+                            debug!("shutting down stream in write task");
+                            break;
+                        },
                     };
                     
                 }
@@ -792,6 +812,8 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
             tokio::join!(read_task, write_task);
             
             {
+                // TODO: check whether this can actually trigger
+                debug!("stream {} terminated", stream_id);
                 let mut connect_streams = connect_streams.lock().unwrap();
                 connect_streams.remove(&stream_id);
             }
@@ -813,6 +835,10 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
                     }
                     let bind_socket = Arc::new(bind_socket);
                     let http3_sender_clone = http3_sender.clone();
+                    let mut stream_ids: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+                    let connect_streams_clone = connect_streams.clone();
+                    let connect_sockets_clone = connect_sockets.clone();
+                   
                     let listen_task = tokio::spawn(async move {
                         let mut buf = [0; 65535];
                         let mut dest_to_flow: HashMap<socks5_proto::Address, u64> = HashMap::new();
@@ -847,7 +873,7 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
                                             let (stream_id_sender, mut stream_id_receiver) = mpsc::channel(1);
                                             let (stream_response_sender, mut stream_response_receiver) = mpsc::unbounded_channel::<Content>();
                                             let (flow_response_sender, mut flow_response_receiver) = mpsc::unbounded_channel::<Content>();
-                                            http3_sender.send(ToSend { content: Content::Request { headers, stream_id_sender }, finished: false, stream_id: 0});
+                                            http3_sender_clone.send(ToSend { content: Content::Request { headers, stream_id_sender }, finished: false, stream_id: u64::MAX});
                                             let stream_id = stream_id_receiver.recv().await.expect("stream_id receiver error");
                                             let flow_id = stream_id / 4;
                                             {
@@ -859,6 +885,7 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
                                                 let mut connect_sockets = connect_sockets.lock().unwrap();
                                                 connect_sockets.insert(flow_id, flow_response_sender); 
                                             }
+                                            
                                             let mut succeeded = false;
                                             let response = stream_response_receiver.recv().await.expect("http3 response receiver error");
                                             if let Content::Headers { headers } = response {
@@ -928,7 +955,10 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
                                                             }
                                                             debug!("written {} bytes from UDP to {} for flow {}", payload.len(), recv_addr, flow_id);
                                                         },
-                                                        Content::Finished => todo!(),
+                                                        Content::Finished =>  {
+                                                            debug!("shutting down stream in write task");
+                                                            break;
+                                                        },
                                                     };
                                                     
                                                 }
@@ -947,19 +977,39 @@ async fn handle_socks5_stream(mut stream: TcpStream, http3_sender: UnboundedSend
                             }
                         }
                     });
-                    tokio::join!(listen_task);
+
+                    let http3_sender_clone_2 = http3_sender.clone();
+                    let terminate_task = tokio::spawn(async move {
+                        let mut buf = [0; 4];
+                        match stream.read(&mut buf).await {
+                            Ok(n) => {
+                                if n > 0 {
+                                    unreachable!()
+                                }
+                            },
+                            Err(e) => {
+                                error!("udp associate control stream read error: {}", e);
+                            }
+                        }
+                        {
+                            let stream_ids = stream_ids.lock().unwrap();
+                            let mut connect_streams = connect_streams_clone.lock().unwrap();
+                            let mut connect_sockets = connect_sockets_clone.lock().unwrap();
+                            listen_task.abort();
+                            for stream_id in stream_ids.iter() {
+                                let stream_id = *stream_id;
+                                let flow_id = stream_id / 4;
+                                debug!("terminating stream {} and flow {}", stream_id, flow_id);
+                                http3_sender_clone_2.send(ToSend { stream_id, content: Content::Finished, finished: true });
+                                connect_sockets.remove(&flow_id);
+                                connect_streams.remove(&stream_id);
+                            }
+                        }
+                    });
+                    tokio::join!(terminate_task);
                 }
             }
             // TODO: handle termination of UDP assoiciate correctly
-            
-            // {
-            //     let mut connect_sockets = connect_sockets.lock().unwrap();
-            //     connect_sockets.remove(&flow_id);
-            // }
-            // {
-            //     let mut connect_streams = connect_streams.lock().unwrap();
-            //     connect_streams.remove(&stream_id);
-            // }
         },
         socks5_proto::Command::Bind => unimplemented!(),
     }
