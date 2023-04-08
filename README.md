@@ -1,4 +1,4 @@
-Masquerade is an implementation of [MASQUE](https://ietf-wg-masque.github.io/). For UDP, it implements the `connect-udp` extended HTTP/3 CONNECT method as defined in [RFC 9228](https://www.rfc-editor.org/rfc/rfc9298.html) using QUIC datagrams defined in [RFC 9227](https://www.rfc-editor.org/rfc/rfc9297.html). For TCP, it implements the HTTP/3 CONNECT method as defined in [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114.html#name-the-connect-method).
+Masquerade is an implementation of [MASQUE]([https://ietf-wg-masque.github.io/](https://datatracker.ietf.org/wg/masque/about/)). For UDP, it implements the `connect-udp` extended HTTP/3 CONNECT method as defined in [RFC 9298](https://www.rfc-editor.org/rfc/rfc9298.html) using HTTP datagrams defined in [RFC 9297](https://www.rfc-editor.org/rfc/rfc9297.html). For TCP, it implements the HTTP/3 CONNECT method as defined in [RFC 9114](https://www.rfc-editor.org/rfc/rfc9114.html#name-the-connect-method).
 
 For client, it exposes a HTTP/1.1 or SOCKS5 interface for easy connection.
 
